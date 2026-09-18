@@ -1,0 +1,33 @@
+# Keep repository files
+/*/
+!/.agents/
+!/.idea/
+!/assets/
+!/core/
+!/desktop/
+!/docs/
+!/gradle/
+!/.github/
+
+# Exclude generated files
+bin/
+build/
+cache/
+dist/
+dists/
+gradle-*-bin/
+out/
+tmp*/
+temp*/
+test*/
+
+# Exclude AI agent files
+.claude/
+.opencode/
+
+# Exclude runtime files
+/ArkPetsConfig.json
+/models_data.json
+/*.log
+
+.codegraph/

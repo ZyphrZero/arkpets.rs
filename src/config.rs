@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DirectionSwitching {
+    Disabled,
+    #[default]
+    DragRelease,
+    Drag,
+    Hover,
+}
+
 /// Runtime options shared by the desktop and web frontends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -12,6 +22,8 @@ pub struct PetConfig {
     pub allow_sleep: bool,
     pub allow_special: bool,
     pub allow_walk: bool,
+    pub activity_level: u8,
+    pub direction_switching: DirectionSwitching,
     pub walk_speed: f32,
     pub physics: PhysicsConfig,
     pub opacity_normal: f32,
@@ -28,6 +40,8 @@ impl Default for PetConfig {
             allow_sleep: false,
             allow_special: true,
             allow_walk: true,
+            activity_level: 4,
+            direction_switching: DirectionSwitching::default(),
             walk_speed: 30.0,
             physics: PhysicsConfig::default(),
             opacity_normal: 1.0,

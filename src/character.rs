@@ -89,6 +89,7 @@ impl CharacterState {
             || self.config.allow_sleep != config.allow_sleep
             || self.config.allow_walk != config.allow_walk
             || self.config.allow_special != config.allow_special
+            || self.config.activity_level != config.activity_level
         {
             self.animation.configure(&config);
         }
@@ -296,6 +297,25 @@ mod tests {
         assert_eq!(character.animation().direction, crate::Direction::Left);
         character.tick(1.0 / 60.0, bounds);
         assert!(character.position().x < 150.0);
+    }
+
+    #[test]
+    fn walking_speed_is_live_and_independent_of_animation_playback() {
+        let mut character =
+            CharacterState::new(model(), PetConfig::default(), Vec2::new(100.0, 100.0), 1);
+        let bounds = Bounds::new(1000.0, 500.0);
+        character.set_position(Vec2::new(300.0, 400.0), bounds);
+        character.play_animation("Move");
+        for speed in [0.0, 30.0, 200.0] {
+            character.configure(PetConfig {
+                walk_speed: speed,
+                ..Default::default()
+            });
+            let before = character.position().x;
+            character.tick(0.1, bounds);
+            assert!((character.position().x - before - speed * 0.1).abs() < 0.001);
+        }
+        assert!((character.animation().timestamp - 0.3).abs() < 0.001);
     }
 
     #[test]

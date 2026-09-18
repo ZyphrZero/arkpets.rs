@@ -33,6 +33,7 @@ pub struct AnimationMachine {
     enabled: Vec<String>,
     pub state: AnimationState,
     rng: StdRng,
+    activity_level: u8,
 }
 
 impl AnimationMachine {
@@ -61,6 +62,7 @@ impl AnimationMachine {
                 ..AnimationState::default()
             },
             rng: StdRng::seed_from_u64(seed),
+            activity_level: crate::PetConfig::default().activity_level,
         }
     }
 
@@ -84,6 +86,7 @@ impl AnimationMachine {
     }
 
     pub fn configure(&mut self, config: &crate::PetConfig) {
+        self.activity_level = config.activity_level.min(16);
         self.enabled = self
             .available
             .iter()
@@ -107,7 +110,16 @@ impl AnimationMachine {
     pub fn complete(&mut self) {
         let current = self.state.animation.clone();
         let names = self.transition_names();
-        let row = transition_row(&names, &current);
+        let mut row = transition_row(&names, &current);
+        // Scale the idle destination, not an entire row (which would leave
+        // normalized probabilities unchanged). Integer weights avoid rounding.
+        for (name, weight) in names.iter().zip(&mut row) {
+            *weight *= if name == "Relax" {
+                u32::from(16 - self.activity_level)
+            } else {
+                8
+            };
+        }
         let next = pick(&names, row, &mut self.rng);
         if current == "Relax" && next == "Move" && self.rng.gen_bool(0.4) {
             self.state.direction = match self.state.direction {
@@ -208,6 +220,40 @@ fn pick(names: &[String], weights: Vec<u32>, rng: &mut StdRng) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_changes_idle_frequency_without_changing_the_animation_clock() {
+        let mut counts = Vec::new();
+        for activity in [0, 4, 8, 16] {
+            let mut machine = AnimationMachine::with_seed(
+                ["Relax", "Move", "Sit", "Sleep"].map(str::to_owned),
+                42,
+            );
+            machine.configure(&crate::PetConfig {
+                activity_level: activity,
+                ..Default::default()
+            });
+            let mut idle = 0;
+            for _ in 0..10_000 {
+                machine.complete();
+                idle += usize::from(machine.state.animation == "Relax");
+            }
+            machine.tick(0.05);
+            assert_eq!(machine.state.timestamp, 0.05);
+            counts.push(idle);
+        }
+        assert!(
+            counts.windows(2).all(|pair| pair[0] > pair[1]),
+            "{counts:?}"
+        );
+        let mut idle_only = AnimationMachine::with_seed(["Relax".into()], 42);
+        idle_only.configure(&crate::PetConfig {
+            activity_level: 16,
+            ..Default::default()
+        });
+        idle_only.complete();
+        assert_eq!(idle_only.state.animation, "Relax");
+    }
 
     #[test]
     fn vehicle_does_not_select_sit_or_sleep() {

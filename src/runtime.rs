@@ -52,6 +52,9 @@ impl PetCommand {
                 Err(CommandError::InvalidAnimationName)
             }
             Self::Configure(config) => {
+                if config.activity_level > 16 {
+                    return Err(CommandError::InvalidConfig("activity_level"));
+                }
                 for (field, value) in [
                     ("walk_speed", config.walk_speed),
                     ("physics.gravity", config.physics.gravity),
@@ -311,6 +314,15 @@ mod tests {
     fn invalid_commands_never_enter_the_queue_or_mutate_state() {
         let mut runtime = runtime();
         let sender = runtime.command_sender();
+        assert!(matches!(
+            sender.try_send(PetCommand::Configure(PetConfig {
+                activity_level: 17,
+                ..Default::default()
+            })),
+            Err(SubmitError::Invalid(CommandError::InvalidConfig(
+                "activity_level"
+            )))
+        ));
         assert!(matches!(
             sender.try_send(PetCommand::PlayAnimation("x".repeat(257))),
             Err(SubmitError::Invalid(CommandError::InvalidAnimationName))

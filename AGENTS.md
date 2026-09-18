@@ -18,10 +18,11 @@
 | `src/bin/arkpets-ui.rs`、`src/ui/mod.rs` | `arkpets-ui` 入口、启动器、设置、状态共享、持久化和帧调度 |
 | `src/model.rs`、`src/config.rs` | 模型清单、资源路径、角色配置 |
 | `src/animation.rs`、`src/physics.rs`、`src/character.rs` | 动作选择、物理、拖拽和角色状态 |
+| `src/interaction.rs` | 与窗口无关的交互翻转模式和指针手势状态 |
 | `src/runtime.rs` | `PetRuntime`、类型化命令、有界队列、暂停和命令执行结果 |
 | `src/spine.rs`、`src/spine_bridge.c`、`build.rs` | Spine 3.8 C 运行时的构建、FFI 所有权、动画与裁剪网格输出 |
 | `src/ui/renderer.rs`、`src/ui/backend.rs` | 图集与网格绘制；后端选择、校验和 bootstrap 配置 |
-| `src/ui/desktop.rs`、`src/ui/platform.rs` | 桌面坐标与物理、工作区边界；Windows 原生窗口集成 |
+| `src/ui/desktop.rs`、`src/ui/desktop/regions.rs`、`src/ui/platform.rs` | 多屏部署与物理、屏幕并集边界；Windows 原生窗口集成 |
 | `src/ui/shell_visibility.rs`、`src/ui/shell_visibility/` | 平台外壳可见性入口，以及 Linux X11、macOS 实现 |
 | `src/ui/smoke.rs`、`src/ui/performance.rs`、`docs/scripts/` | 截图、真实窗口交互回归和性能采样 |
 | `assets/`、`vendor/` | 样例模型与字体；随仓库维护的第三方代码及许可证 |
@@ -91,6 +92,9 @@ pwsh -NoProfile -File docs/scripts/Verify-RendererSwitch.ps1 -Renderer dx12 -Des
 
 # PowerShell 7：任务栏可见性和自动/手动底部边界
 pwsh -NoProfile -File docs/scripts/Verify-Interaction.ps1 -Renderer dx12 -DesktopSettings
+
+# 动作设置、多屏开关与初始部署的实际操作和保存
+pwsh -NoProfile -File docs/scripts/Verify-Interaction.ps1 -Renderer dx12 -BehaviorSettings
 ```
 
 后端切换和桌面交互变更也应按影响范围使用 `-Renderer opengl` 复测。透明验证必须检查系统合成后能看到受控背景，仅有 GPU 截图 Alpha 通道不足以证明原生窗口透明。

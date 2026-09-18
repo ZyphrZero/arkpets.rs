@@ -8,6 +8,7 @@
 pub mod animation;
 pub mod character;
 pub mod config;
+pub mod interaction;
 pub mod model;
 pub mod physics;
 pub mod runtime;
@@ -16,7 +17,7 @@ pub mod spine;
 
 pub use animation::{AnimationMachine, AnimationState, Direction};
 pub use character::{CharacterSnapshot, CharacterState};
-pub use config::PetConfig;
+pub use config::{DirectionSwitching, PetConfig};
 pub use model::{CharacterModel, ModelCatalog, ModelError};
 pub use physics::{Bounds, PhysicsConfig, PhysicsState, Vec2};
 pub use runtime::{CommandError, CommandSender, PetCommand, PetEvent, PetRuntime, SubmitError};

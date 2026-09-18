@@ -118,8 +118,9 @@ function Click-Client([IntPtr]$Window, [double]$X, [double]$Y) {
     if (-not [ArkRendererSwitch]::ClientToScreen($Window, [ref]$point)) { throw 'ClientToScreen failed' }
     if (-not [ArkRendererSwitch]::SetCursorPos($point.X, $point.Y)) { throw 'SetCursorPos failed' }
     Start-Sleep -Milliseconds 80
-    if ([ArkRendererSwitch]::GetAncestor([ArkRendererSwitch]::WindowFromPoint($point), 2) -ne $Window) {
-        throw 'Another window covers the sample; no click was sent'
+    $target = [ArkRendererSwitch]::GetAncestor([ArkRendererSwitch]::WindowFromPoint($point), 2)
+    if ($target -ne $Window) {
+        throw "Another window covers the sample at client ($X,$Y), screen ($($point.X),$($point.Y)): expected HWND $Window, found $target; no click was sent"
     }
     [ArkRendererSwitch]::LeftButton($true)
     try { Start-Sleep -Milliseconds 80 } finally { [ArkRendererSwitch]::LeftButton($false) }
@@ -178,8 +179,8 @@ try {
         $next = if ($current -eq 'dx12') { 'opengl' } else { 'dx12' }
         $timer.Restart()
         # The settings page must survive each switch; select without an Apply button.
-        Click-Client $root 300 617
-        $row = if ($next -eq 'dx12') { 655 } else { 697 }
+        Click-Client $root 300 701
+        $row = if ($next -eq 'dx12') { 739 } else { 781 }
         Click-Client $root 300 $row
         $root = Wait-Window $false $root
         Show-Root $root

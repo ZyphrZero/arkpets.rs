@@ -22,6 +22,7 @@ pub use winit;
 
 pub mod clipboard;
 mod dropped_file;
+pub mod monitors;
 mod safe_area;
 mod window_settings;
 
@@ -1359,6 +1360,7 @@ pub fn update_viewport_info(
     is_init: bool,
 ) {
     profiling::function_scope!();
+    monitors::update(egui_ctx, window);
     let pixels_per_point = pixels_per_point(egui_ctx, window);
 
     let has_a_position = match window.is_minimized() {

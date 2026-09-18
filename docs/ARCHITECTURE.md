@@ -8,11 +8,12 @@
 | --- | --- | --- |
 | `src/model.rs`、`src/config.rs` | 本地模型清单、资源位置、角色参数 | 不创建窗口或 GPU 资源 |
 | `src/animation.rs`、`src/physics.rs`、`src/character.rs` | 动作选择、物理与角色状态 | 由调用方提供时间步长和边界 |
+| `src/interaction.rs` | 四档交互翻转、水平位移阈值与释放方向 | 不依赖窗口系统；前端传入物理像素指针坐标 |
 | `src/runtime.rs` | `PetRuntime`、类型化命令、暂停与自动动作、命令处理结果 | 不知道 egui、Spine、网络或进程通信 |
 | `src/spine.rs`、`src/spine_bridge.c` | 官方 Spine 3.8 的所有权、动画推进与裁剪网格输出 | 只处理可信本地 Spine 3.8 资源 |
 | `src/ui/renderer.rs` | 图集纹理、网格转换、连续 slot 批处理 | 不决定行为或处理外部协议 |
 | `src/ui/backend.rs` | 后端选择、平台可用性校验、独立 bootstrap 配置 | 在创建窗口和 GPU 资源之前确定后端 |
-| `src/ui/desktop.rs` | 桌宠窗口位置、工作区与手动底部边界、拖拽与桌面物理 | Windows 自动读取显示器工作区；手动高度以物理像素转换到 UI 坐标 |
+| `src/ui/desktop.rs`、`src/ui/desktop/regions.rs` | 多屏部署、工作区、拖拽与桌面物理；屏幕区域并集的投影和移动约束 | Windows 自动读取工作区；各屏幕按当前窗口 DPI 转换到同一坐标系 |
 | `src/ui/platform.rs` | Windows 桌宠任务栏与 Alt+Tab 样式、边框颜色和圆角属性 | 仅访问当前 GUI 线程的桌宠窗口，不合成图像 |
 | `src/ui/shell_visibility.rs` 及其子模块 | 跨平台系统条目可见性；Linux EWMH、macOS AppKit | 保持桌宠映射和动画运行，不重建渲染器；macOS 策略作用于整个应用 |
 | `src/ui/mod.rs` | 原生窗口、设置、输入、持久化与帧调度 | 将核心状态转换成 UI 和渲染调用 |
@@ -35,6 +36,14 @@
 Windows 拖动从 `GetCursorPos` 读取屏幕光标，再转换到显示器工作区坐标。窗口自身移动不会被误认为鼠标移动；释放速度受物理参数的最大速度限制。获取光标失败会报告错误并停止该次拖动。其他平台使用窗口输入换算的坐标，仍需分别实机验证。
 
 桌宠每秒刷新一次活动边界，暂停时也保持这项低频检查。自动模式读取 `MONITORINFO.rcWork`；手动模式保留工作区的上、左、右边界，以 `rcMonitor.bottom - height / pixels_per_point` 替换底部边界。设置变更立即触发读取，保留当前屏幕位置并裁剪越界坐标，降低底部边界后由重力继续落下。
+
+`vendor/egui-winit/src/monitors.rs` 在原生事件循环中读取 winit 的全部显示器位置、尺寸及主屏标志，并在 egui Context 的临时数据中每秒更新一次物理像素快照。`DesktopMotion` 将这些区域除以当前视口的 `pixels_per_point`，Windows 再按各屏幕工作区修正底部。DPI 变化时先按旧、新比例换算已有位置与速度，保持物理位置；显示器变更最迟在快照与桌宠的下一轮刷新后应用。
+
+移动范围是屏幕工作区域的并集，包围矩形仅用于通用物理积分。`regions::travel` 分别沿水平和垂直方向检查整个窗口扫过的区域，屏幕间空洞和错位边缘会阻挡移动，不能用快速抛掷跳过空隙。拖拽、热插拔和配置变更使用最近有效位置投影；拖拽锚点按窗口尺寸比例保存。完全放不下桌宠时明确报错，请求用户减小显示比例。
+
+`Preferences.multi_monitors` 决定使用全部屏幕还是仅主屏；`initial_position` 保存 `0–1` 的二维比例，首次创建桌宠时映射到主屏可活动范围。重新打开会再次部署，渲染后端切换保留已有 `DesktopMotion`，不会重新应用初始位置。
+
+`PetConfig.activity_level` 在自动动作完成时缩放待机目的状态的权重，范围 `0–16`；其他动作保持原来的相对权重，不改变动画时间步长。`DirectionGesture` 在预览和桌宠中分别维护指针历史，按累计水平移动过滤抖动；Windows 桌宠使用屏幕光标坐标，避免窗口移动产生错误翻转。行走速度沿用逻辑坐标单位，设置范围扩展到 `0–200`。
 
 系统条目可见性共用 `show_in_taskbar` 偏好。Windows 使用 `WS_EX_TOOLWINDOW` / `WS_EX_APPWINDOW`，运行中按照隐藏、更新样式、无激活显示的顺序通知系统外壳。原生子类通过 `WM_STYLECHANGING` 保留此策略，避免 winit 在显示窗口、置顶和鼠标穿透变更时覆盖。此选项不改变 `ViewportBuilder.taskbar`，因此不会触发 eframe 重建窗口和 GPU surface。
 

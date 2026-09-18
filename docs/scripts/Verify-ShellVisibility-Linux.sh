@@ -97,10 +97,13 @@ assert_animation() {
 assert_state true
 assert_animation hidden
 xdotool windowsize "$root" 1200 1000 windowmove "$root" 10 10
-xdotool mousemove --window "$root" 700 500 click --repeat 12 --delay 20 5
+sleep 0.5 # Wait for the WM to apply geometry before translating pointer coordinates.
+xdotool mousemove --window "$root" 700 500
+sleep 0.1
+xdotool click --repeat 40 --delay 20 5
 sleep 0.5
 for hidden in false true false; do
-    xdotool mousemove --window "$root" 270 808 click 1
+    xdotool mousemove --window "$root" 270 638 click 1
     assert_state "$hidden"
 done
 assert_animation shown

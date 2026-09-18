@@ -9,8 +9,9 @@ mod shell_visibility;
 mod smoke;
 
 use arkpets::{
-    runtime::CommandKind, Bounds, CharacterModel, CharacterState, Direction, ModelCatalog,
-    PetCommand, PetConfig, PetRuntime, Vec2 as PetVec2,
+    interaction::DirectionGesture, runtime::CommandKind, Bounds, CharacterModel, CharacterState,
+    Direction, DirectionSwitching, ModelCatalog, PetCommand, PetConfig, PetRuntime,
+    Vec2 as PetVec2,
 };
 use backend::RendererBackend;
 use eframe::egui::{
@@ -50,6 +51,8 @@ struct Preferences {
     show_in_taskbar: bool,
     auto_taskbar_height: bool,
     taskbar_height: u32,
+    multi_monitors: bool,
+    initial_position: [f32; 2],
 }
 
 impl Default for Preferences {
@@ -65,6 +68,8 @@ impl Default for Preferences {
             show_in_taskbar: false,
             auto_taskbar_height: cfg!(windows),
             taskbar_height: 48,
+            multi_monitors: true,
+            initial_position: [0.2, 0.2],
         }
     }
 }
@@ -95,6 +100,7 @@ pub struct App {
     next_frame: Instant,
     preview_next_frame: Instant,
     preview_direction: Direction,
+    preview_gesture: DirectionGesture,
     animation_name: String,
     first_position: bool,
     frame_ms: f32,
@@ -155,6 +161,7 @@ impl App {
             next_frame: Instant::now(),
             preview_next_frame: Instant::now(),
             preview_direction: Direction::Right,
+            preview_gesture: DirectionGesture::default(),
             animation_name: String::new(),
             first_position: true,
             frame_ms: 0.0,
@@ -753,6 +760,8 @@ impl App {
                     if let Some(point) = ctx.input(|input| input.pointer.press_origin()) {
                         character
                             .start_drag(PetVec2::new(point.x - rect.left(), point.y - rect.top()));
+                        self.preview_gesture
+                            .start_drag(point.x * ctx.pixels_per_point());
                         force = true;
                     }
                 }
@@ -765,9 +774,21 @@ impl App {
                         );
                     }
                 }
+                if let Some(direction) = self.preview_gesture.update(
+                    ctx.input(|input| input.pointer.latest_pos())
+                        .map(|p| p.x * ctx.pixels_per_point()),
+                    response.hovered(),
+                    &self.prefs.config,
+                ) {
+                    character.set_direction(direction);
+                }
                 if response.drag_stopped() {
                     character.end_drag();
+                    if let Some(direction) = self.preview_gesture.release(&self.prefs.config) {
+                        character.set_direction(direction);
+                    }
                 }
+                self.preview_direction = character.animation().direction;
                 if !character.is_hidden() {
                     renderer.paint(
                         &painter,
@@ -804,9 +825,42 @@ impl App {
                 ui.checkbox(&mut self.prefs.config.allow_special, "允许特殊动作");
                 ui.checkbox(&mut self.prefs.config.allow_interact, "允许触摸和拖拽");
                 ui.add(
-                    egui::Slider::new(&mut self.prefs.config.walk_speed, 0.0..=120.0)
-                        .text("行走速度"),
+                    egui::Slider::new(&mut self.prefs.config.walk_speed, 0.0..=200.0)
+                        .text("行走速度")
+                        .suffix(" 逻辑像素/秒"),
                 );
+                ui.add(
+                    egui::Slider::new(&mut self.prefs.config.activity_level, 0..=16)
+                        .text("动作活跃度")
+                        .suffix(" 级"),
+                )
+                .on_hover_text("数值越高，自动动作越少选择待机；不会改变动画播放速度。");
+                let direction_label = |mode| match mode {
+                    DirectionSwitching::Disabled => "禁用",
+                    DirectionSwitching::DragRelease => "松开拖拽时",
+                    DirectionSwitching::Drag => "拖拽时",
+                    DirectionSwitching::Hover => "光标掠过时",
+                };
+                egui::ComboBox::from_label("交互式朝向翻转")
+                    .selected_text(direction_label(self.prefs.config.direction_switching))
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            DirectionSwitching::Disabled,
+                            DirectionSwitching::DragRelease,
+                            DirectionSwitching::Drag,
+                            DirectionSwitching::Hover,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.prefs.config.direction_switching,
+                                mode,
+                                direction_label(mode),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "跟随鼠标的水平移动方向；后面的选项同时包含前面的拖拽触发方式。",
+                    );
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(12.0);
@@ -899,6 +953,31 @@ impl App {
                             .suffix(" px"),
                     )
                     .changed();
+                area_changed |= ui
+                    .checkbox(&mut self.prefs.multi_monitors, "启用多显示屏")
+                    .on_hover_text(
+                        "开启后可拖到其他显示器，并可在相接的屏幕间行走；关闭后限制在主显示器。",
+                    )
+                    .changed();
+                ui.add_space(12.0);
+                ui.label("初始部署位置");
+                ui.small("相对主显示器可活动范围；重新打开桌宠时生效。");
+                for (axis, label) in ["水平位置（左 → 右）", "垂直位置（上 → 下）"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut percent = self.prefs.initial_position[axis] * 100.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut percent, 0.0..=100.0)
+                                .text(label)
+                                .suffix(" %"),
+                        )
+                        .changed()
+                    {
+                        self.prefs.initial_position[axis] = percent / 100.0;
+                    }
+                }
                 if area_changed {
                     if let Some(motion) = &mut self.desktop_motion {
                         motion.next_work_area_update = Instant::now();
@@ -918,6 +997,8 @@ impl App {
                     self.prefs.show_in_taskbar = defaults.show_in_taskbar;
                     self.prefs.auto_taskbar_height = defaults.auto_taskbar_height;
                     self.prefs.taskbar_height = defaults.taskbar_height;
+                    self.prefs.multi_monitors = defaults.multi_monitors;
+                    self.prefs.initial_position = defaults.initial_position;
                     if let Some(motion) = &mut self.desktop_motion {
                         motion.next_work_area_update = Instant::now();
                     }
@@ -1014,19 +1095,28 @@ impl App {
             self.desktop_motion = None;
             return None;
         }
+        let renderer = self.renderer.as_ref()?;
+        let size = renderer.size(180.0 * self.prefs.config.display_scale);
+        let window_size = size + Vec2::new(40.0, 20.0);
         if self.desktop_motion.is_none() {
             let pixels_per_point = ctx.pixels_per_point();
-            let area = ctx.input(|input| {
-                let viewport = input.viewport();
-                desktop::work_area(
-                    viewport.monitor_size.unwrap_or(Vec2::new(1280.0, 720.0)),
-                    viewport.outer_rect.map_or(Pos2::ZERO, |r| r.min),
+            let motion = desktop::movement_areas(
+                ctx,
+                pixels_per_point,
+                self.prefs.bottom_height(),
+                self.prefs.multi_monitors,
+            )
+            .and_then(|(areas, primary)| {
+                desktop::DesktopMotion::deploy(
+                    areas,
+                    primary,
+                    window_size,
+                    self.prefs.initial_position,
                     pixels_per_point,
-                    self.prefs.bottom_height(),
                 )
             });
-            match area {
-                Ok(area) => self.desktop_motion = Some(desktop::DesktopMotion::new(area)),
+            match motion {
+                Ok(motion) => self.desktop_motion = Some(motion),
                 Err(error) => {
                     self.error = Some(format!("读取桌面工作区失败: {error}"));
                     self.desktop_open = false;
@@ -1035,9 +1125,6 @@ impl App {
             }
         }
         let motion = self.desktop_motion.as_mut().unwrap();
-        let renderer = self.renderer.as_ref()?;
-        let size = renderer.size(180.0 * self.prefs.config.display_scale);
-        let window_size = size + Vec2::new(40.0, 20.0);
         let builder = egui::ViewportBuilder::default()
             .with_title("ArkPets - 桌宠")
             .with_visible(false)
@@ -1112,26 +1199,27 @@ impl App {
         let character = runtime.character_mut();
         let size = renderer.size(180.0 * self.prefs.config.display_scale);
         let window_size = size + Vec2::new(40.0, 20.0);
-        if started >= motion.next_work_area_update {
+        let pixels_per_point = ctx.pixels_per_point();
+        if started >= motion.next_work_area_update
+            || motion.pixels_per_point != pixels_per_point
+            || motion.size != window_size
+        {
             motion.next_work_area_update = started + Duration::from_secs(1);
-            let pixels_per_point = ctx.pixels_per_point();
-            let area = ctx.input(|input| {
-                desktop::work_area(
-                    input
-                        .viewport()
-                        .monitor_size
-                        .unwrap_or(Vec2::new(1280.0, 720.0)),
-                    motion.screen_position() + window_size * 0.5,
-                    pixels_per_point,
-                    bottom_height,
-                )
-            });
-            match area {
-                Ok(area) => motion.set_work_area(area, window_size),
-                Err(error) => {
-                    self.error = Some(format!("读取桌面工作区失败: {error}"));
-                    ctx.request_repaint_of(egui::ViewportId::ROOT);
-                }
+            if let Err(error) = desktop::movement_areas(
+                &ctx,
+                pixels_per_point,
+                bottom_height,
+                self.prefs.multi_monitors,
+            )
+            .and_then(|(areas, primary)| {
+                motion.set_areas(areas, window_size, pixels_per_point)?;
+                motion.finish_deployment(primary, window_size);
+                Ok(())
+            }) {
+                self.error = Some(format!("读取桌面工作区失败: {error}"));
+                self.desktop_open = false;
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                return;
             }
         }
         let mut interacted = false;
@@ -1149,17 +1237,10 @@ impl App {
                 .inner_rect
                 .map_or(motion.screen_position(), |rect| rect.min)
         });
-        let pixels_per_point = ctx.pixels_per_point();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
             .show(root_ui, |ui| {
                 let target = Rect::from_min_size(Pos2::new(20.0, 20.0), size);
-                renderer.paint(
-                    ui.painter(),
-                    target,
-                    character.animation().direction,
-                    self.prefs.config.opacity_normal,
-                );
                 let response =
                     ui.interact(target, ui.id().with("desktop-pet"), Sense::click_and_drag());
                 if response.clicked() {
@@ -1171,7 +1252,7 @@ impl App {
                         .map(|p| window_origin + p.to_vec2());
                     match desktop::cursor_position(pixels_per_point, fallback) {
                         Ok(Some(cursor)) => {
-                            motion.body.start_drag(motion.local_cursor(cursor));
+                            motion.start_drag(cursor, window_size);
                             character.play_animation("Relax");
                             interacted = true;
                         }
@@ -1182,31 +1263,56 @@ impl App {
                         Ok(None) => {}
                     }
                 }
-                if motion.body.dragging {
-                    if simulation_due {
-                        let fallback = response
-                            .interact_pointer_pos()
-                            .map(|p| window_origin + p.to_vec2());
-                        match desktop::cursor_position(pixels_per_point, fallback) {
-                            Ok(Some(cursor)) => motion.body.drag_to(
-                                motion.local_cursor(cursor),
-                                dt,
-                                Bounds::new(motion.work_area.width(), motion.work_area.height()),
-                                PetVec2::new(window_size.x, window_size.y),
-                                self.prefs.config.physics.max_velocity,
-                            ),
-                            Err(error) => {
-                                motion.body.end_drag();
-                                self.error = Some(format!("读取鼠标位置失败: {error}"));
-                                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                if motion.body.dragging || response.hovered() {
+                    let fallback = ctx
+                        .input(|input| input.pointer.latest_pos())
+                        .map(|p| window_origin + p.to_vec2());
+                    match desktop::cursor_position(pixels_per_point, fallback) {
+                        Ok(cursor) => {
+                            if let Some(direction) = motion.gesture.update(
+                                cursor.map(|p| p.x * pixels_per_point),
+                                response.hovered(),
+                                &self.prefs.config,
+                            ) {
+                                character.set_direction(direction);
                             }
-                            Ok(None) => {}
+                            if motion.body.dragging {
+                                if !self.prefs.config.allow_interact {
+                                    motion.body.end_drag();
+                                } else if let Some(cursor) = cursor {
+                                    motion.drag_to(
+                                        cursor,
+                                        ctx.input(|input| input.unstable_dt),
+                                        window_size,
+                                        self.prefs.config.physics.max_velocity,
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            motion.body.end_drag();
+                            motion.gesture = DirectionGesture::default();
+                            self.error = Some(format!("读取鼠标位置失败: {error}"));
+                            ctx.request_repaint_of(egui::ViewportId::ROOT);
                         }
                     }
-                    if response.drag_stopped() || !ctx.input(|input| input.pointer.primary_down()) {
-                        motion.body.end_drag();
+                } else {
+                    motion.gesture.update(None, false, &self.prefs.config);
+                }
+                if motion.body.dragging
+                    && (response.drag_stopped() || !ctx.input(|input| input.pointer.primary_down()))
+                {
+                    motion.body.end_drag();
+                    if let Some(direction) = motion.gesture.release(&self.prefs.config) {
+                        character.set_direction(direction);
                     }
                 }
+                renderer.paint(
+                    ui.painter(),
+                    target,
+                    character.animation().direction,
+                    self.prefs.config.opacity_normal,
+                );
                 response.context_menu(|ui| {
                     if ui.button("关闭桌宠").clicked() {
                         self.desktop_open = false;
@@ -1603,6 +1709,20 @@ mod tests {
     use super::*;
 
     fn test_app(ctx: &egui::Context) -> App {
+        // Feed monitor input explicitly, like RawInput below; unit tests do not
+        // have a native event loop. Real window geometry is verified by scripts.
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::NULL,
+                egui_winit::monitors::MonitorSnapshot {
+                    monitors: vec![egui_winit::monitors::MonitorInfo {
+                        rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0)),
+                        primary: true,
+                    }],
+                    updated: Instant::now(),
+                },
+            )
+        });
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
         let catalog = ModelCatalog::from_json_file(root.join("models.json")).unwrap();
         let mut app = App {
@@ -1625,6 +1745,7 @@ mod tests {
             next_frame: Instant::now(),
             preview_next_frame: Instant::now(),
             preview_direction: Direction::Right,
+            preview_gesture: DirectionGesture::default(),
             animation_name: String::new(),
             first_position: true,
             frame_ms: 0.0,
@@ -1744,6 +1865,17 @@ mod tests {
         assert_eq!(prefs.fps, 30);
         assert!(!prefs.show_in_taskbar);
         assert_eq!(prefs.auto_taskbar_height, cfg!(windows));
+        assert!(prefs.multi_monitors);
+        assert_eq!(prefs.initial_position, [0.2, 0.2]);
+        assert_eq!(prefs.config.activity_level, 4);
+        assert_eq!(
+            prefs.config.direction_switching,
+            DirectionSwitching::DragRelease
+        );
+        prefs.multi_monitors = false;
+        prefs.initial_position = [0.8, 0.1];
+        prefs.config.activity_level = 12;
+        prefs.config.direction_switching = DirectionSwitching::Hover;
         prefs.show_in_taskbar = true;
         prefs.auto_taskbar_height = false;
         prefs.taskbar_height = 120;
@@ -1751,6 +1883,13 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         assert!(restored.show_in_taskbar);
         assert_eq!(restored.bottom_height(), Some(120));
+        assert!(!restored.multi_monitors);
+        assert_eq!(restored.initial_position, [0.8, 0.1]);
+        assert_eq!(restored.config.activity_level, 12);
+        assert_eq!(
+            restored.config.direction_switching,
+            DirectionSwitching::Hover
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ param(
     [string]$Executable = "$PSScriptRoot/../../target/debug/arkpets-ui.exe",
     [ValidateSet('dx12', 'opengl')][string]$Renderer = 'dx12',
     [switch]$DesktopSettings,
+    [switch]$BehaviorSettings,
     [string]$OutputDirectory
 )
 
@@ -185,6 +186,22 @@ function Click-Client([IntPtr]$Window, [double]$X, [double]$Y) {
     Start-Sleep -Milliseconds 150
 }
 
+function Set-Number([IntPtr]$Window, [double]$X, [double]$Y, [int]$Value) {
+    Click-Client $Window $X $Y
+    [ArkPetsInteraction]::Key(0x11, $true)
+    try {
+        [ArkPetsInteraction]::Key(0x41, $true)
+        [ArkPetsInteraction]::Key(0x41, $false)
+    } finally { [ArkPetsInteraction]::Key(0x11, $false) }
+    foreach ($digit in $Value.ToString().ToCharArray()) {
+        [ArkPetsInteraction]::Key([uint16]$digit, $true)
+        [ArkPetsInteraction]::Key([uint16]$digit, $false)
+    }
+    [ArkPetsInteraction]::Key(0x0D, $true)
+    [ArkPetsInteraction]::Key(0x0D, $false)
+    Start-Sleep -Milliseconds 100
+}
+
 function Wait-TaskbarStyle([bool]$Visible, [IntPtr]$Previous) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
@@ -350,13 +367,13 @@ try {
         $height = $client.Bottom / $scale
         # The settings scroll area is at the bottom; rows are anchored above the footer.
         foreach ($visible in @($true, $false, $true)) {
-            Click-Client $root 270 ($height - 192)
+            Click-Client $root 270 ($height - 362)
             $pet = Wait-TaskbarStyle $visible $pet
             Write-InteractionLog "Taskbar/Alt+Tab style PASS: visible=$visible"
         }
-        Click-Client $root 270 ($height - 164)
+        Click-Client $root 270 ($height - 334)
         foreach ($heightPx in @(120, 0, 80)) {
-            Click-Client $root 395 ($height - 130)
+            Click-Client $root 395 ($height - 300)
             [ArkPetsInteraction]::Key(0x11, $true)
             try {
                 [ArkPetsInteraction]::Key(0x41, $true)
@@ -371,9 +388,51 @@ try {
             Wait-Floor $pet ($work.Monitor.Bottom - $heightPx)
             Write-InteractionLog "Custom floor PASS: $heightPx physical pixels from monitor bottom"
         }
-        Click-Client $root 270 ($height - 164)
+        Click-Client $root 270 ($height - 334)
         Wait-Floor $pet $work.Work.Bottom
         Write-InteractionLog 'Automatic floor PASS: returned to system work area'
+    }
+
+    if ($BehaviorSettings) {
+        $report.stage = 'behavior_settings'
+        $scale = [ArkPetsInteraction]::GetDpiForWindow($root) / 96.0
+        if (-not [ArkPetsInteraction]::SetWindowPos($root, [IntPtr](-1), 10, 10, [int](1200 * $scale), [int](1000 * $scale), 0x10)) { throw 'Cannot resize settings window' }
+        Click-Client $root 100 156
+        $point = Client-ScreenPoint $root (700 * $scale) (500 * $scale)
+        Move-Pointer $point.X $point.Y
+        Assert-PointerTarget $root
+        [ArkPetsInteraction]::Wheel(12000)
+        Start-Sleep -Milliseconds 500
+        Set-Number $root 400 299 200 # Walk speed.
+        Set-Number $root 395 341 16 # Activity level.
+        Click-Client $root 300 383
+        Click-Client $root 300 547 # Hover, including drag and release.
+        Set-Number $root 395 493 0 # Keep deployment stationary for native coordinate assertions.
+        Move-Pointer $point.X $point.Y
+        Assert-PointerTarget $root
+        [ArkPetsInteraction]::Wheel(-12000)
+        Start-Sleep -Milliseconds 500
+        $client = New-Object ArkPetsInteraction+Rect
+        if (-not [ArkPetsInteraction]::GetClientRect($root, [ref]$client)) { throw 'Cannot read settings client area' }
+        $height = $client.Bottom / $scale
+        Click-Client $root 270 ($height - 264) # Restrict to primary display.
+        Set-Number $root 395 ($height - 171) 80
+        Set-Number $root 395 ($height - 129) 10
+        Click-DesktopToggle $root
+        $null = Wait-SampleWindow $true $false 2500
+        Click-DesktopToggle $root
+        $pet = Wait-SampleWindow $true $true 2500
+        Start-Sleep -Milliseconds 500
+        $rect = Read-WindowRect $pet
+        $work.Size = [Runtime.InteropServices.Marshal]::SizeOf($work)
+        if (-not [ArkPetsInteraction]::GetMonitorInfo([ArkPetsInteraction]::MonitorFromWindow($pet, 2), [ref]$work)) { throw 'Cannot read deployment monitor' }
+        $expectedX = $work.Work.Left + ($work.Work.Right - $work.Work.Left - $rect.width) * 0.8
+        $expectedY = $work.Work.Top + ($work.Work.Bottom - $work.Work.Top - $rect.height) * 0.1
+        if ([Math]::Abs($rect.x - $expectedX) -gt 2 -or [Math]::Abs($rect.y - $expectedY) -gt 2) {
+            throw "Deployment did not follow 80%,10%: expected $expectedX,$expectedY; observed $($rect.x),$($rect.y)"
+        }
+        $report.deployment = $rect
+        Write-InteractionLog 'Deployment PASS: real native window opened at 80%,10% with gravity disabled'
     }
 
     $report.stage = 'close_root'
@@ -382,6 +441,13 @@ try {
     if (-not $process.WaitForExit(2000)) { throw 'ROOT WM_CLOSE did not terminate the sample within two seconds' }
     $report.close_elapsed_ms = $closeTimer.Elapsed.TotalMilliseconds
     if ($process.ExitCode -ne 0) { throw "Sample process exited with $($process.ExitCode)" }
+    if ($BehaviorSettings) {
+        $saved = Get-Content -LiteralPath (Join-Path $outputPath 'test-preferences.ron') -Raw
+        foreach ($expected in @('activityLevel:16', 'directionSwitching:hover', 'walkSpeed:200.0', 'gravity:0.0', 'multi_monitors:false', 'initial_position:(0.8,0.1)')) {
+            if (-not $saved.Contains($expected)) { throw "Behavior preference was not persisted: $expected" }
+        }
+        Write-InteractionLog 'Behavior settings PASS: speed, activity, direction mode, multi-monitor switch and deployment persisted'
+    }
     $report.stage = 'complete'
     $report.success = $true
     Write-InteractionLog "Interaction PASS ($Renderer): ROOT closed the sample in $([Math]::Round($report.close_elapsed_ms)) ms"

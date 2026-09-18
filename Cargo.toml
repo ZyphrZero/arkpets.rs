@@ -1,0 +1,56 @@
+[package]
+name = "arkpets"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Cross-platform Rust core for Arknights desktop pets"
+license = "GPL-3.0-only"
+default-run = "arkpets-ui"
+
+[features]
+default = ["ui"]
+spine = ["dep:cc"]
+ui = ["spine", "dep:eframe", "dep:egui-winit", "dep:wgpu", "dep:image", "dep:egui-phosphor", "dep:x11rb", "dep:objc2", "dep:objc2-app-kit"]
+
+[[bin]]
+name = "arkpets-ui"
+path = "src/bin/arkpets-ui.rs"
+required-features = ["ui"]
+
+[dependencies]
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+eframe = { version = "0.36.2", optional = true, default-features = false, features = ["default_fonts", "x11", "wayland", "persistence"] }
+egui-winit = { version = "0.36.2", optional = true, default-features = false }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+egui-phosphor = { version = "0.14", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.36.2", optional = true, default-features = false, features = ["glow", "wgpu_no_default_features"] }
+wgpu = { version = "30", optional = true, default-features = false, features = ["dx12"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Controls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWindow"] }
+eframe = { version = "0.36.2", optional = true, default-features = false, features = ["wgpu_no_default_features"] }
+wgpu = { version = "30", optional = true, default-features = false, features = ["metal"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+eframe = { version = "0.36.2", optional = true, default-features = false, features = ["wgpu_no_default_features"] }
+wgpu = { version = "30", optional = true, default-features = false, features = ["vulkan", "gles"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13.2", optional = true }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

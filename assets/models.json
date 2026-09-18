@@ -1,0 +1,5 @@
+[
+  {"id":"pepe","name":"佩佩","type":"基建","skeleton":"4058_pepe/build_char_4058_pepe.skel","atlas":"4058_pepe/build_char_4058_pepe.atlas","texture":"4058_pepe/build_char_4058_pepe.png","resourcePath":"models"},
+  {"id":"whitw2","name":"荒芜拉普兰德","type":"基建","skeleton":"1038_whitw2/build_char_1038_whitw2.skel","atlas":"1038_whitw2/build_char_1038_whitw2.atlas","texture":"1038_whitw2/build_char_1038_whitw2.png","resourcePath":"models"},
+  {"id":"frston-3","name":"Friston-3","type":"基建","skeleton":"4093_frston/build_char_4093_frston.skel","atlas":"4093_frston/build_char_4093_frston.atlas","texture":"4093_frston/build_char_4093_frston.png","resourcePath":"models"}
+]

@@ -8,9 +8,14 @@
 !/docs/
 !/gradle/
 !/.github/
+!/src/
+!/src/bin/
+!/tests/
+!/vendor/
 
 # Exclude generated files
 bin/
+!/src/bin/
 build/
 cache/
 dist/
@@ -20,14 +25,16 @@ out/
 tmp*/
 temp*/
 test*/
+!/tests/
+/target/
 
 # Exclude AI agent files
 .claude/
 .opencode/
+.zcode/
+.codegraph/
 
 # Exclude runtime files
 /ArkPetsConfig.json
 /models_data.json
 /*.log
-
-.codegraph/

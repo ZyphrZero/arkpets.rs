@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod macos;
 mod regions;
 
 use arkpets::{
@@ -189,11 +191,19 @@ impl DesktopMotion {
 }
 
 /// Read screen coordinates without reusing a moving window's cached pointer position.
-pub fn cursor_position(pixels_per_point: f32, fallback: Option<Pos2>) -> io::Result<Option<Pos2>> {
-    if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+pub fn cursor_position(
+    pixels_per_point: f32,
+    zoom_factor: f32,
+    fallback: Option<Pos2>,
+) -> io::Result<Option<Pos2>> {
+    if !pixels_per_point.is_finite()
+        || pixels_per_point <= 0.0
+        || !zoom_factor.is_finite()
+        || zoom_factor <= 0.0
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "pixels_per_point must be finite and positive",
+            "pixels_per_point and zoom_factor must be finite and positive",
         ));
     }
     #[cfg(windows)]
@@ -209,7 +219,12 @@ pub fn cursor_position(pixels_per_point: f32, fallback: Option<Pos2>) -> io::Res
             Pos2::new(position.x as f32, position.y as f32) / pixels_per_point,
         ))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = fallback;
+        macos::cursor_position(zoom_factor).map(Some)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(fallback)
     }
@@ -421,7 +436,9 @@ mod tests {
     #[test]
     fn cursor_position_rejects_an_invalid_coordinate_scale() {
         for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            let error = cursor_position(scale, Some(Pos2::ZERO)).unwrap_err();
+            let error = cursor_position(scale, 1.0, Some(Pos2::ZERO)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let error = cursor_position(2.0, scale, Some(Pos2::ZERO)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
     }
@@ -489,14 +506,14 @@ mod tests {
         assert_eq!(motion.body.velocity, PetVec2::ZERO);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
-    fn cursor_position_uses_the_supplied_fallback_outside_windows() {
+    fn cursor_position_uses_the_supplied_fallback_without_native_sampling() {
         let position = Pos2::new(-40.0, 70.0);
         assert_eq!(
-            cursor_position(2.0, Some(position)).unwrap(),
+            cursor_position(2.0, 1.0, Some(position)).unwrap(),
             Some(position)
         );
-        assert_eq!(cursor_position(2.0, None).unwrap(), None);
+        assert_eq!(cursor_position(2.0, 1.0, None).unwrap(), None);
     }
 }

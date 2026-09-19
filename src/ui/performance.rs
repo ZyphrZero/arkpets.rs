@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Serialize)]
 pub struct Settings {
     pub model: String,
+    pub page: String,
     pub fps: u32,
     pub warmup_seconds: u64,
     pub duration_seconds: u64,
@@ -28,6 +29,7 @@ struct State {
     started_unix_ms: u128,
     root: Frames,
     desktop: Frames,
+    animation_updates: usize,
     finished: bool,
 }
 
@@ -70,6 +72,8 @@ struct Report<'a> {
     measurement_end_unix_ms: u128,
     root: FrameReport,
     desktop: FrameReport,
+    animation_updates: usize,
+    animation_update_rate_hz: f64,
 }
 
 impl Profile {
@@ -86,6 +90,11 @@ impl Profile {
         })?;
         let settings = Settings {
             model: env::var("ARKPETS_PROFILE_MODEL").unwrap_or_else(|_| "pepe".into()),
+            page: match env::var("ARKPETS_PROFILE_PAGE") {
+                Err(env::VarError::NotPresent) => "settings".into(),
+                Ok(page) if matches!(page.as_str(), "library" | "settings") => page,
+                _ => return Err("ARKPETS_PROFILE_PAGE must be library or settings".into()),
+            },
             fps: number("ARKPETS_PROFILE_FPS", 60, 1, 240)? as u32,
             warmup_seconds: number("ARKPETS_PROFILE_WARMUP", 2, 2, 60)?,
             duration_seconds: number("ARKPETS_PROFILE_SECONDS", 8, 8, 120)?,
@@ -120,7 +129,7 @@ impl Profile {
     }
 
     /// Records UI callback completion, before GPU submission and presentation.
-    pub fn desktop_callback_finished(&self) {
+    pub fn desktop_callback_finished(&self, animation_advanced: bool) {
         let now = Instant::now();
         let mut state = self
             .state
@@ -135,6 +144,9 @@ impl Profile {
         }
         let (begin, end) = self.window(&state).expect("desktop recording has started");
         state.desktop.record(now, begin, end, None);
+        if animation_advanced && now >= begin && now <= end {
+            state.animation_updates += 1;
+        }
     }
 
     /// Poll from the active viewport; a true result asks the caller to close ROOT.
@@ -164,13 +176,18 @@ impl Profile {
             os: env::consts::OS,
             architecture: env::consts::ARCH,
             debug_assertions: cfg!(debug_assertions),
-            scenario: "desktop pet with settings page visible; one model at scale 1; Relax animation",
-            metric_scope: "Callback cadence is not display-present FPS. Update durations are CPU wall time. GPU scan-out is not measured.",
+            scenario: match self.settings.page.as_str() {
+                "library" => "desktop pet with library page visible; one model at scale 1; Relax animation",
+                _ => "desktop pet with settings page visible; one model at scale 1; Relax animation",
+            },
+            metric_scope: "Callback cadence and CPU animation update rate are not display-present FPS. Update durations are CPU wall time. GPU scan-out is not measured.",
             settings: &self.settings,
             measurement_start_unix_ms: begin_unix_ms,
             measurement_end_unix_ms: begin_unix_ms + self.settings.duration_seconds as u128 * 1000,
             root: state.root.report(self.settings.fps),
             desktop: state.desktop.report(self.settings.fps),
+            animation_updates: state.animation_updates,
+            animation_update_rate_hz: state.animation_updates as f64 / self.settings.duration_seconds as f64,
         };
         let json = serde_json::to_vec_pretty(&report)
             .map_err(|error| format!("Cannot serialize performance report: {error}"))?;

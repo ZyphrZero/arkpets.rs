@@ -1,5 +1,7 @@
 mod backend;
 mod desktop;
+#[cfg(target_os = "macos")]
+mod menu_bar;
 mod performance;
 #[cfg(windows)]
 mod platform;
@@ -36,6 +38,23 @@ fn desktop_id() -> egui::ViewportId {
 
 struct NativeApp {
     state: Arc<Mutex<App>>,
+    #[cfg(target_os = "macos")]
+    menu_bar: menu_bar::MenuBar,
+    #[cfg(target_os = "macos")]
+    dock_visible: Option<bool>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeApp {
+    fn sync_dock_visibility(&mut self) {
+        let show = self.state.lock().unwrap().prefs.show_in_taskbar;
+        if self.dock_visible != Some(show) {
+            match shell_visibility::set_application_visible(show) {
+                Ok(()) => self.dock_visible = Some(show),
+                Err(error) => self.state.lock().unwrap().error = Some(error),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -194,7 +213,7 @@ impl App {
                 "profile model must exist"
             );
             result.desktop_open = true;
-            result.page = 1;
+            result.page = usize::from(profile.settings().page == "settings");
         }
         result
     }
@@ -1082,22 +1101,20 @@ impl App {
     fn desktop_builder(&mut self, ctx: &egui::Context) -> Option<egui::ViewportBuilder> {
         if !self.desktop_open {
             #[cfg(target_os = "macos")]
-            if self
-                .desktop_motion
-                .as_ref()
-                .is_some_and(|motion| motion.taskbar_visibility == Some(false))
-            {
-                if let Err(error) = shell_visibility::restore_launcher() {
-                    self.error = Some(error);
-                    return None;
-                }
+            if self.desktop_motion.is_some() {
+                ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::Visible(false));
             }
             self.desktop_motion = None;
+            #[cfg(target_os = "macos")]
+            return self.desktop_viewport_builder(None);
+            #[cfg(not(target_os = "macos"))]
             return None;
         }
         let renderer = self.renderer.as_ref()?;
         let size = renderer.size(180.0 * self.prefs.config.display_scale);
         let window_size = size + Vec2::new(40.0, 20.0);
+        #[cfg(target_os = "macos")]
+        let opening = self.desktop_motion.is_none();
         if self.desktop_motion.is_none() {
             let pixels_per_point = ctx.pixels_per_point();
             let motion = desktop::movement_areas(
@@ -1124,7 +1141,26 @@ impl App {
                 }
             }
         }
-        let motion = self.desktop_motion.as_mut().unwrap();
+        let motion = self.desktop_motion.as_ref().unwrap();
+        #[cfg(target_os = "macos")]
+        if opening {
+            // A reused hidden viewport does not receive a UI callback until it is
+            // visible again. Wake it here for both toolbar and menu requests.
+            ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::InnerSize(window_size));
+            ctx.send_viewport_cmd_to(
+                desktop_id(),
+                egui::ViewportCommand::OuterPosition(motion.screen_position()),
+            );
+            ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::Visible(true));
+            ctx.request_repaint_of(desktop_id());
+        }
+        self.desktop_viewport_builder(Some(motion.screen_position()))
+    }
+
+    fn desktop_viewport_builder(&self, position: Option<Pos2>) -> Option<egui::ViewportBuilder> {
+        let renderer = self.renderer.as_ref()?;
+        let window_size =
+            renderer.size(180.0 * self.prefs.config.display_scale) + Vec2::new(40.0, 20.0);
         let builder = egui::ViewportBuilder::default()
             .with_title("ArkPets - 桌宠")
             .with_visible(false)
@@ -1134,7 +1170,6 @@ impl App {
             // Native styles control taskbar visibility without recreating the viewport.
             .with_taskbar(false)
             .with_inner_size(window_size)
-            .with_position(motion.screen_position())
             .with_resizable(false)
             .with_window_level(if self.prefs.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
@@ -1142,7 +1177,11 @@ impl App {
                 egui::WindowLevel::Normal
             })
             .with_mouse_passthrough(self.prefs.click_through);
-        Some(builder)
+        Some(if let Some(position) = position {
+            builder.with_position(position)
+        } else {
+            builder
+        })
     }
 
     fn desktop_frame(&mut self, root_ui: &mut egui::Ui) {
@@ -1250,7 +1289,7 @@ impl App {
                     let fallback = response
                         .interact_pointer_pos()
                         .map(|p| window_origin + p.to_vec2());
-                    match desktop::cursor_position(pixels_per_point, fallback) {
+                    match desktop::cursor_position(pixels_per_point, ctx.zoom_factor(), fallback) {
                         Ok(Some(cursor)) => {
                             motion.start_drag(cursor, window_size);
                             character.play_animation("Relax");
@@ -1267,7 +1306,7 @@ impl App {
                     let fallback = ctx
                         .input(|input| input.pointer.latest_pos())
                         .map(|p| window_origin + p.to_vec2());
-                    match desktop::cursor_position(pixels_per_point, fallback) {
+                    match desktop::cursor_position(pixels_per_point, ctx.zoom_factor(), fallback) {
                         Ok(cursor) => {
                             if let Some(direction) = motion.gesture.update(
                                 cursor.map(|p| p.x * pixels_per_point),
@@ -1346,15 +1385,11 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
         if !paused {
-            request_next_frame(&ctx, &mut self.next_frame, self.prefs.fps);
+            request_next_frame(&ctx, &mut self.next_frame, self.prefs.fps, started);
         }
-        ctx.request_repaint_after(
-            motion
-                .next_work_area_update
-                .saturating_duration_since(Instant::now()),
-        );
+        request_repaint_at(&ctx, motion.next_work_area_update);
         if let Some(profile) = &self.profile {
-            profile.desktop_callback_finished();
+            profile.desktop_callback_finished(!paused && simulation_due);
             if profile.finish_if_ready().expect("write performance report") {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
             }
@@ -1366,6 +1401,41 @@ impl App {
 }
 
 impl App {
+    fn preview_visible(&self, ctx: &egui::Context) -> bool {
+        self.page == 0
+            && self.renderer.is_some()
+            && ctx.input(|input| {
+                input
+                    .raw
+                    .viewports
+                    .get(&egui::ViewportId::ROOT)
+                    .is_some_and(|viewport| viewport.visible() != Some(false))
+            })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_menu_requests(&mut self, ctx: &egui::Context, requests: menu_bar::Requests) {
+        if requests.quit {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            return;
+        }
+        if let Some(open) = requests.desktop_open {
+            if !open || self.renderer.is_some() {
+                self.desktop_open = open;
+                self.desktop_builder(ctx);
+            }
+        }
+        if requests.show_launcher {
+            for command in [
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Focus,
+            ] {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, command);
+            }
+        }
+    }
+
     fn update_ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         let update_started = Instant::now();
@@ -1440,8 +1510,10 @@ impl App {
                 .apply(PetCommand::SetAutomatic(self.prefs.automatic))
                 .unwrap();
         }
-        if !self.paused() && self.page == 0 {
-            request_next_frame(&ctx, &mut self.preview_next_frame, self.prefs.fps);
+        // A visible preview must keep painting even when the desktop callback
+        // owns Spine updates. Hidden and paused previews need no animation timer.
+        if !self.paused() && self.preview_visible(&ctx) {
+            request_next_frame(&ctx, &mut self.preview_next_frame, self.prefs.fps, now);
         }
         if self.desktop_open && ctx.input(|input| !input.events.is_empty()) {
             ctx.request_repaint_of(desktop_id());
@@ -1453,13 +1525,30 @@ impl App {
 }
 
 impl eframe::App for NativeApp {
+    #[cfg(target_os = "macos")]
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let requests = self.menu_bar.take_requests();
+        let mut state = self.state.lock().unwrap();
+        state.handle_menu_requests(ctx, requests);
+        self.menu_bar
+            .update(state.desktop_open, state.renderer.is_some());
+        drop(state);
+        self.sync_dock_visibility();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let builder = {
             let mut state = self.state.lock().unwrap();
             state.update_ui(ui, frame);
-            state.desktop_builder(&ctx)
+            let builder = state.desktop_builder(&ctx);
+            #[cfg(target_os = "macos")]
+            self.menu_bar
+                .update(state.desktop_open, state.renderer.is_some());
+            builder
         };
+        #[cfg(target_os = "macos")]
+        self.sync_dock_visibility();
         if let Some(builder) = builder {
             let state = self.state.clone();
             ctx.show_viewport_deferred(desktop_id(), builder, move |ui, _| {
@@ -1494,7 +1583,13 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
     .on_hover_text(tooltip)
 }
 
-fn request_next_frame(ctx: &egui::Context, deadline: &mut Instant, fps: u32) {
+fn request_next_frame(ctx: &egui::Context, deadline: &mut Instant, fps: u32, started: Instant) {
+    // An event callback can start early and finish after the deadline without
+    // advancing animation. Keep that frame due instead of silently skipping it.
+    if started < *deadline {
+        request_repaint_at(ctx, *deadline);
+        return;
+    }
     let period = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let now = Instant::now();
     if now.saturating_duration_since(*deadline) > period * 4 {
@@ -1504,10 +1599,14 @@ fn request_next_frame(ctx: &egui::Context, deadline: &mut Instant, fps: u32) {
             *deadline += period;
         }
     }
-    // egui subtracts predicted_dt from its delay; compensate so our deadline
-    // is an actual frame limit, including on high-refresh-rate displays.
+    request_repaint_at(ctx, *deadline);
+}
+
+fn request_repaint_at(ctx: &egui::Context, deadline: Instant) {
+    // egui subtracts predicted_dt from its delay. Compensate for all deadlines,
+    // including slow work-area polling, so early wakeups do not spin until due.
     let prediction = ctx.input(|input| Duration::from_secs_f32(input.predicted_dt));
-    ctx.request_repaint_after(deadline.saturating_duration_since(now) + prediction);
+    ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()) + prediction);
 }
 
 fn metadata(ui: &mut egui::Ui, key: &str, value: &str) {
@@ -1630,6 +1729,13 @@ fn run_backend(selected: RendererBackend, state: &mut Option<Arc<Mutex<App>>>) -
         // Reuse eframe's event loop after releasing the old windows and GPU resources.
         // Keeping the same process also keeps the launching shell attached until exit.
         run_and_return: true,
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use egui_winit::winit::platform::macos::{
+                ActivationPolicy, EventLoopBuilderExtMacOS as _,
+            };
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         #[cfg(target_os = "linux")]
         event_loop_builder: Some(Box::new(|builder| {
             use egui_winit::winit::platform::x11::EventLoopBuilderExtX11 as _;
@@ -1662,7 +1768,19 @@ fn run_backend(selected: RendererBackend, state: &mut Option<Arc<Mutex<App>>>) -
                 *state = Some(app.clone());
                 app
             };
-            Ok(Box::new(NativeApp { state: app }))
+            #[cfg(target_os = "macos")]
+            let menu_bar = {
+                shell_visibility::initialize_application()?;
+                let ctx = cc.egui_ctx.clone();
+                menu_bar::MenuBar::new(move || ctx.request_repaint_of(egui::ViewportId::ROOT))?
+            };
+            Ok(Box::new(NativeApp {
+                state: app,
+                #[cfg(target_os = "macos")]
+                menu_bar,
+                #[cfg(target_os = "macos")]
+                dock_visible: None,
+            }))
         }),
     )
 }
@@ -1763,6 +1881,68 @@ mod tests {
         app
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn menu_requests_work_without_a_ui_pass_and_preserve_pet_state() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.set_paused(true);
+        let spine = &app.renderer.as_ref().unwrap().spine as *const _;
+        let input = egui::RawInput::default();
+        for open in [true, false, true] {
+            let output = ctx.run_logic(&input, |ctx| {
+                app.handle_menu_requests(
+                    ctx,
+                    menu_bar::Requests {
+                        desktop_open: Some(open),
+                        ..Default::default()
+                    },
+                );
+            });
+            assert_eq!(app.desktop_open, open);
+            assert!(app.paused());
+            assert_eq!(&app.renderer.as_ref().unwrap().spine as *const _, spine);
+            assert!(!output
+                .viewport_commands
+                .contains_key(&egui::ViewportId::ROOT));
+            assert!(output.viewport_commands[&desktop_id()]
+                .contains(&egui::ViewportCommand::Visible(open)));
+        }
+        let output = ctx.run_logic(&input, |ctx| {
+            app.handle_menu_requests(
+                ctx,
+                menu_bar::Requests {
+                    show_launcher: true,
+                    ..Default::default()
+                },
+            );
+        });
+        assert!(app.desktop_open && app.paused());
+        assert_eq!(
+            output.viewport_commands[&egui::ViewportId::ROOT],
+            vec![
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Focus,
+            ]
+        );
+        let output = ctx.run_logic(&input, |ctx| {
+            app.handle_menu_requests(
+                ctx,
+                menu_bar::Requests {
+                    show_launcher: true,
+                    desktop_open: Some(false),
+                    quit: true,
+                },
+            );
+        });
+        assert!(app.desktop_open);
+        assert_eq!(
+            output.viewport_commands[&egui::ViewportId::ROOT],
+            vec![egui::ViewportCommand::Close]
+        );
+    }
+
     #[test]
     fn renderer_rebind_preserves_pet_state_and_command_queue() {
         let ctx = egui::Context::default();
@@ -1822,6 +2002,9 @@ mod tests {
             assert_eq!(builder.decorations, Some(false));
 
             app.desktop_open = false;
+            #[cfg(target_os = "macos")]
+            assert_eq!(app.desktop_builder(&ctx).unwrap().visible, Some(false));
+            #[cfg(not(target_os = "macos"))]
             assert!(app.desktop_builder(&ctx).is_none());
             assert!(app.desktop_motion.is_none());
         }
@@ -1890,6 +2073,138 @@ mod tests {
             restored.config.direction_switching,
             DirectionSwitching::Hover
         );
+    }
+
+    #[test]
+    fn early_callback_cannot_consume_an_animation_deadline() {
+        let ctx = egui::Context::default();
+        let due = Instant::now() - Duration::from_millis(5);
+        let mut deadline = due;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            request_next_frame(ui.ctx(), &mut deadline, 60, due - Duration::from_millis(1));
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(deadline, due, "early event skipped a pose update");
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            request_next_frame(ui.ctx(), &mut deadline, 60, due);
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            deadline > due,
+            "consumed animation frame was not rescheduled"
+        );
+    }
+
+    #[test]
+    fn visible_preview_animates_without_pointer_input_with_or_without_a_desktop_pet() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut time = 0.0;
+        for (desktop_open, page, paused, minimized, occluded, animated) in [
+            (true, 0, false, false, false, true),
+            (true, 1, false, false, false, false),
+            (true, 0, true, false, false, false),
+            (true, 0, false, true, false, false),
+            (true, 0, false, false, true, false),
+            (false, 0, false, false, false, true),
+            (false, 1, false, false, false, false),
+            (false, 0, true, false, false, false),
+            (false, 0, false, true, false, false),
+            (false, 0, false, false, true, false),
+        ] {
+            app.desktop_open = desktop_open;
+            app.page = page;
+            app.set_paused(paused);
+            // Let egui's initial layout and follow-up repaints settle.
+            for pass in 0..5 {
+                time += 1.0;
+                let mut input = egui::RawInput {
+                    time: Some(time),
+                    focused: false,
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 780.0))),
+                    ..Default::default()
+                };
+                let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+                viewport.minimized = Some(minimized);
+                viewport.occluded = Some(occluded);
+                viewport.focused = Some(false);
+                let output = ctx.run_ui(input, |ui| app.update_ui(ui, &mut frame));
+                if pass == 4 {
+                    assert_eq!(
+                        output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                            != Duration::MAX,
+                        animated,
+                        "desktop={desktop_open}, page={page}, paused={paused}"
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn preview_repaints_reuse_the_desktop_pose() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.desktop_open = true;
+        let pose = |app: &mut App| {
+            let mut parts = Vec::new();
+            app.renderer.as_mut().unwrap().spine.meshes(&mut parts);
+            parts
+                .into_iter()
+                .flat_map(|part| part.positions)
+                .collect::<Vec<_>>()
+        };
+        app.advance(&ctx, 1.0 / 60.0);
+        let before = pose(&mut app);
+        assert!(!before.is_empty());
+        let mut frame = eframe::Frame::_new_kittest();
+        for _ in 0..10 {
+            app.last_frame = Instant::now() - Duration::from_millis(20);
+            app.preview_next_frame = app.last_frame;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.update_ui(ui, &mut frame)
+            })
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(
+            before,
+            pose(&mut app),
+            "preview advanced the shared skeleton twice"
+        );
+        app.advance(&ctx, 0.1);
+        assert_ne!(
+            before,
+            pose(&mut app),
+            "desktop driver did not advance the pose"
+        );
+    }
+
+    #[test]
+    fn paused_desktop_waits_until_the_work_area_deadline() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.desktop_open = true;
+        app.desktop_builder(&ctx).unwrap();
+        app.set_paused(true);
+        let motion = app.desktop_motion.as_mut().unwrap();
+        motion.taskbar_visibility = Some(app.prefs.show_in_taskbar);
+        #[cfg(windows)]
+        {
+            motion.appearance_ready = true;
+        }
+        motion.last_window_position = Some(motion.screen_position());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        motion.next_work_area_update = deadline;
+        for pass in 0..5 {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| app.desktop_frame(ui));
+            if pass == 4 {
+                let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                assert!(Instant::now() + delay >= deadline, "early wake: {delay:?}");
+            }
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]

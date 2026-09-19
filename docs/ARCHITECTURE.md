@@ -16,6 +16,7 @@
 | `src/ui/desktop.rs`、`src/ui/desktop/regions.rs` | 多屏部署、工作区、拖拽与桌面物理；屏幕区域并集的投影和移动约束 | Windows 自动读取工作区；各屏幕按当前窗口 DPI 转换到同一坐标系 |
 | `src/ui/platform.rs` | Windows 桌宠任务栏与 Alt+Tab 样式、边框颜色和圆角属性 | 仅访问当前 GUI 线程的桌宠窗口，不合成图像 |
 | `src/ui/shell_visibility.rs` 及其子模块 | 跨平台系统条目可见性；Linux EWMH、macOS AppKit | 保持桌宠映射和动画运行，不重建渲染器；macOS 策略作用于整个应用 |
+| `src/ui/menu_bar.rs` | macOS 原生菜单栏入口与菜单动作 | `NativeApp` 持有 `NSStatusItem` 和动作接收对象；独立于 Dock 策略 |
 | `src/ui/mod.rs` | 原生窗口、设置、输入、持久化与帧调度 | 将核心状态转换成 UI 和渲染调用 |
 | `src/ui/performance.rs`、`docs/scripts/` | 可重复的性能采样和实际窗口透明验证 | 诊断显式启用，不参与日常逐帧截图 |
 
@@ -28,12 +29,12 @@
 动画推进有一个明确的驱动者：
 
 - 桌宠关闭且模型库预览可见时，根窗口按设定频率推进和绘制动画。
-- 桌宠打开时，deferred 桌宠回调负责推进动画和桌面物理，根窗口不再定时重绘。主预览显示最后一次根窗口绘制时的状态，输入或设置变更会刷新它。
+- 桌宠打开时，deferred 桌宠回调负责推进动画和桌面物理。可见的模型库预览按设定帧率持续绘制共享网格，不重复推进 Spine；无需鼠标输入，两处模型均持续播放。
 - 暂停后停止定时动画更新，输入和外部命令仍可以唤醒窗口。关闭桌宠后，预览恢复其更新职责。
 
-帧调度维护绝对截止时间，并补偿 egui 对 `predicted_dt` 的减除；只有到达截止时间才推进骨骼和物理。鼠标、焦点或窗口事件仍可请求绘制、处理命令，但不会因此额外推进动画。窗口位置按物理像素对齐并与实际已发送的位置比较，避免重复移动命令又触发更多重绘事件。
+帧调度维护绝对截止时间，并通过 `request_repaint_at` 统一补偿 egui 对 `predicted_dt` 的减除；动画和每秒工作区检查都使用该入口，避免暂停时在检查截止时间前反复唤醒。只有到达动画截止时间才推进骨骼和物理。只有回调开始时已经到期，才能安排下一次动画截止时间；提前到达的事件回调即使在绘制中越过截止时间，也必须保留尚未更新的那一帧，避免回调频率正常但实际动画更新降到一半。根窗口仅在模型已载入、模型库可见且未暂停时安排预览绘制定时器，与桌宠是否打开无关；动画推进和窗口绘制分开管理，两个窗口共用一次骨骼计算。可见性通过根视口的 `ViewportInfo::visible()` 判断，最小化或系统报告完全遮挡时停止预览刷新，未获得键盘焦点仍继续播放。鼠标、焦点或窗口事件仍可请求绘制、处理命令，但不会因此额外推进骨骼。窗口位置按物理像素对齐并与实际已发送的位置比较，避免重复移动命令又触发更多重绘事件。
 
-Windows 拖动从 `GetCursorPos` 读取屏幕光标，再转换到显示器工作区坐标。窗口自身移动不会被误认为鼠标移动；释放速度受物理参数的最大速度限制。获取光标失败会报告错误并停止该次拖动。其他平台使用窗口输入换算的坐标，仍需分别实机验证。
+Windows 拖动从 `GetCursorPos` 读取屏幕光标，再转换到显示器工作区坐标。macOS 在主线程通过 `NSEvent.mouseLocation` 读取全局逻辑坐标，使用 `NSScreen.screens` 中第一块屏幕的高度翻转 Y 轴，以匹配 winit 的桌面原点；不使用随焦点窗口变化的 `mainScreen`。Retina backing scale 在 winit 到 egui 的换算中抵消，只需再除以界面 zoom factor。两个平台均不把当前窗口位置与缓存的窗口内鼠标坐标相加，因此窗口自身移动不会被误认为鼠标移动；释放速度受物理参数的最大速度限制。获取光标失败会报告错误并停止该次拖动。Linux 仍使用窗口输入换算的坐标，需要独立实机验证。`verify-macos-drag` 使用真实 AppKit 窗口和系统光标，回归缓存局部坐标滞后时的位置与释放速度。
 
 桌宠每秒刷新一次活动边界，暂停时也保持这项低频检查。自动模式读取 `MONITORINFO.rcWork`；手动模式保留工作区的上、左、右边界，以 `rcMonitor.bottom - height / pixels_per_point` 替换底部边界。设置变更立即触发读取，保留当前屏幕位置并裁剪越界坐标，降低底部边界后由重力继续落下。
 
@@ -49,7 +50,13 @@ Windows 拖动从 `GetCursorPos` 读取屏幕光标，再转换到显示器工�
 
 Linux 显式选择 X11，在 Wayland 会话下通过 XWayland 运行。设置变更时按 PID 和窗口标题定位自己的桌宠窗口，未映射时保留其他状态并写入初始 EWMH 提示；已映射时发送 `_NET_WM_STATE` 请求，由窗口管理器更新 `SKIP_TASKBAR` / `SKIP_PAGER`。不设置 `HIDDEN` 状态，也不取消窗口映射。窗口管理器必须声明支持这两个状态，Alt+Tab 的具体筛选行为取决于桌面环境。
 
-macOS 在 AppKit 主线程切换 `NSApplication` 的 Regular/Accessory 激活策略，并保留策略切换前已显示的窗口。桌宠通过 `NSWindowCollectionBehavior` 控制窗口循环和 Mission Control 行为，禁用失去激活时隐藏；启动器与桌宠处于同一进程，因此 Dock/Command+Tab 策略作用于整个应用。收起桌宠会恢复 Regular 策略。两种非 Windows 实现均不改变动画调度。
+macOS 事件循环以 Accessory 策略启动，`NativeApp` 随后按独立的 `show_in_taskbar` 偏好同步 Regular/Accessory 策略；只有偏好变更才切换，不再随桌宠启动或收起变化。启动时设置进程名称并通过 `NSApplication.applicationIconImage` 安装嵌入的 `assets/arkpets-icon.png`，从 Cargo 启动也使用固定图标，避免重新显示 Dock 时回到可执行文件的通用图标。图标由 `docs/scripts/Generate-MacOSIcon.swift` 中的原创几何图形生成。
+
+激活策略切换可能异步让出应用激活状态，使启动器在 `isVisible` 仍为真的情况下退到其他应用后方；因此记录原本的前台状态和键盘焦点窗口，并通过主 dispatch 队列恢复。回调检查策略仍匹配和窗口当前可见性，跳过已关闭、隐藏或最小化的窗口；仅存在于 `NSApplication.windows()` 中不足以判断窗口存活。后台应用不会主动激活。应用级策略在释放共享 App 锁之后同步，桌宠回调只调整自身的 `NSWindowCollectionBehavior`，禁用失去激活时隐藏。收起桌宠只隐藏原生窗口并清空桌面物理状态；异步回调不能将隐藏窗口重新显示。
+
+macOS 菜单栏由 `NSStatusItem` / `NSMenu` 实现，启动器创建后即显示，独立于 Dock 策略和桌宠开关。使用 macOS 11 起提供的系统符号 `pawprint.fill`，以 18 逻辑点的模板图像放入方形状态项；按钮仅显示图标，系统负责浅色／深色适配，应用名保留在悬停与辅助功能描述中。原生回调只记录显示主界面、桌宠目标开关状态或退出请求，并通过 egui Context 唤醒根视口；重复开关在下一帧前合并为最终状态。`NativeApp::logic` 处理请求，使隐藏或最小化时也能响应。
+
+eframe 在所有窗口不可见时仅调用 `logic`，不会创建新的 deferred 视口。因此 macOS 在模型载入后预先创建隐藏桌宠视口，收起时也保留该原生窗口及 surface；没有 `DesktopMotion` 时回调立即返回，不播放动画、不安排桌宠定时重绘。主界面按钮和菜单请求共用 `desktop_builder`：首次部署或重新部署时设置窗口大小和位置，显式显示并唤醒已有视口。不能等隐藏视口的首帧回调再显示它，否则重新启动时回调不会执行。此流程不向根视口发送恢复或聚焦命令；只有“显示主界面”恢复启动器。Windows/Linux 仍按原有方式在收起时销毁视口。菜单退出提交根视口关闭命令并走偏好保存流程。菜单对象放在 `NativeApp`，不放进 deferred 回调捕获的 `App`，避免通过 Context 形成引用环；释放时先摘除菜单，再移除系统状态项，不增加周期性轮询或第二套动画驱动。
 
 ## 渲染路径
 
@@ -113,13 +120,16 @@ Agent CLI 的进程启动、标准输入输出、JSONL 解析、重连和用户�
 
 性能比较使用相同机器和 release 构建，固定渲染后端、模型、动作、缩放、目标帧率和窗口场景。Windows 运行 `docs/scripts/Measure-Performance.ps1` 后会先预热，再在桌宠显示且设置页打开的场景下采样；测试偏好与正常用户配置隔离。后端可通过 `ARKPETS_RENDERER` 指定，报告数值应同时记录实际选择的后端。
 
+macOS 使用 `python3 docs/scripts/measure_macos_performance.py` 采样真实 Metal UI，默认模型库与桌宠同时可见，也支持 `--page settings`。脚本通过 `ARKPETS_PROFILE_PAGE=library|settings` 选择场景，直接使用环境变量时默认仍为设置页。预热后每约 100 ms 读取 `ps` 累计 CPU 时间和 RSS，按 `frames.json` 的测量窗口筛选；`process.json` 记录采样、平均 CPU 占用（单核为 100%）、平均/峰值 RSS 和可执行文件 SHA-256。采样脚本本身及 WindowServer 的 CPU 不计入应用进程。应顺序运行窗口采样，不同时执行构建或其他压力负载。
+
 | 输出 | 测量内容 | 不能据此推出 |
 | --- | --- | --- |
-| `frames.json` | 桌宠回调完成时刻之间的间隔、p50/p95/p99、超过目标周期 1.5 倍的次数、根窗口更新耗时 | GPU 呈现或显示器实际 FPS |
+| `frames.json` | 桌宠回调完成时刻之间的间隔、p50/p95/p99、超过目标周期 1.5 倍的次数、根窗口更新耗时，以及实际推进骨骼的次数和频率（`animation_updates` / `animation_update_rate_hz`） | GPU 呈现或显示器实际 FPS |
 | `memory.json` | 每 100 ms 采样的进程工作集和私有内存，按实际测量时间窗口筛选，附可执行文件哈希 | 显存占用或单个分配来源 |
+| macOS `process.json` | 采样窗口内进程 CPU 时间增量、RSS 及可执行文件哈希 | GPU 利用率、显存或 WindowServer 开销 |
 | `stdout.log`、`stderr.log` | 所选适配器、运行错误和采样结束信息 | 单独证明透明显示或动画正确 |
 | `Verify-Desktop.ps1` 截图 | 控制背景下的实际系统透明合成与模型像素 | 长时间负载的稳定帧率 |
 
 回调结束后仍有 egui 网格处理、GPU 提交和系统呈现工作，因此报告中的 Hz 不标记为屏幕 FPS。状态栏 CPU 时间来自 eframe 的应用耗时，与脚本记录的回调间隔是不同指标。工作集可能受到驱动和系统内存管理影响，需要同时查看私有内存并在一致条件下复测。
 
-跨平台 CI 定义了 Windows、macOS、Linux 的编译、测试和静态检查；Linux 另有独立 Xvfb/Openbox 桌面上的系统条目与动画像素回归。当前本机已运行 Windows 和 WSL Linux 验证，macOS 仅完成新增 AppKit 模块的双架构类型检查，未实测窗口效果。Linux 明确依赖 X11/XWayland，不将原生 Wayland 的限制隐藏为成功结果。
+跨平台 CI 定义了 Windows、macOS、Linux 的编译、测试和静态检查；Linux 另有独立 Xvfb/Openbox 桌面上的系统条目与动画像素回归。既有验证包含 Windows 和 WSL Linux；macOS 26.5.2 / Apple M2 已运行完整目标测试、Clippy、release 构建，以及 `cargo run --locked --example verify-macos-shell-visibility` 原生窗口回归，覆盖主界面前台状态、Dock 策略切换、隐藏/最小化窗口、收起桌宠和后台不抢焦点。实际 Metal 应用也已检查启动桌宠前后两个窗口的系统可见性与应用激活状态。既有 GPU 截图自检在该机器报告预览动画像素变化为 0，未通过完整截图验证；Intel Mac、其他 macOS 版本、多屏混合 DPI 和系统透明合成仍需分别实测。Linux 明确依赖 X11/XWayland，不将原生 Wayland 的限制隐藏为成功结果。

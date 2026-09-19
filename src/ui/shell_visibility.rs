@@ -34,6 +34,11 @@ pub fn set_visible(show: bool) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn restore_launcher() -> Result<(), String> {
-    macos::set_application_visible(true)
+pub fn set_application_visible(show: bool) -> Result<(), String> {
+    macos::set_application_visible(show)
+}
+
+#[cfg(target_os = "macos")]
+pub fn initialize_application() -> Result<(), String> {
+    macos::initialize_application()
 }

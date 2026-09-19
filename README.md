@@ -4,7 +4,7 @@
 
 已包含三个真实样例模型：佩佩、荒芜拉普兰德、Friston-3。支持模型搜索、收藏、本地导入、自动与手动动作、预览区拖拽和物理、显示与行为设置，以及透明、置顶、可拖动的桌宠窗口。桌宠窗口具有独立的重力、行走和边界转向，支持自动识别 Windows 任务栏、手动设置底部高度，以及任务栏和 Alt+Tab 显示开关。偏好保存在操作系统的应用用户目录。
 
-启动器与桌宠共享一份模型、运行时和 GPU 纹理。打开桌宠后，由桌宠窗口独立推进动画；启动器停止定时重绘，模型预览仅在输入等事件发生时刷新。原始图集和系统 DPI 绘制比例保留，不通过缩小纹理或降低窗口像素密度节省资源。
+启动器与桌宠共享一份模型、运行时和 GPU 纹理。模型库中的角色预览持续播放，无需移动鼠标；打开桌宠后，由桌宠窗口推进动画，预览按设置的帧率持续绘制同一份模型状态，不重复计算骨骼。主界面最小化、隐藏或被系统标记为完全遮挡时，以及切到设置页后，停止预览动画刷新；恢复可见后自动继续。原始图集和系统 DPI 绘制比例保留，不通过缩小纹理或降低窗口像素密度节省资源。
 
 ## 运行
 
@@ -13,7 +13,7 @@ cargo run
 cargo run --release
 ```
 
-需要 Rust 1.95 或更新的 stable 工具链，以及 C 编译工具链。Windows 安装 Visual Studio C++ Build Tools，并安装支持所选 DX12 或 OpenGL 后端的显卡驱动；macOS 安装 Xcode Command Line Tools；Linux 安装 GCC/Clang 以及 `libxkbcommon-dev`、`libxkbcommon-x11-dev`、`libwayland-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev`、`libxrandr-dev` 等系统开发包，并提供 X11 或 XWayland 桌面会话。日常使用和性能比较使用 release 构建。
+需要 Rust 1.95 或更新的 stable 工具链，以及 C 编译工具链。Windows 安装 Visual Studio C++ Build Tools，并安装支持所选 DX12 或 OpenGL 后端的显卡驱动；macOS 需要 11 或更新版本并安装 Xcode Command Line Tools；Linux 安装 GCC/Clang 以及 `libxkbcommon-dev`、`libxkbcommon-x11-dev`、`libwayland-dev`、`libx11-dev`、`libxi-dev`、`libxcursor-dev`、`libxrandr-dev` 等系统开发包，并提供 X11 或 XWayland 桌面会话。日常使用和性能比较使用 release 构建。
 
 程序依次查找 `ARKPETS_ASSETS` 环境变量、可执行文件旁的 `assets`、当前目录中的 `assets`。分发 release 可执行文件时，需要同时携带 `assets/`、`LICENSE`、`THIRD_PARTY_NOTICES.md` 与 Spine 许可证。
 
@@ -38,11 +38,13 @@ cargo run --release -- --renderer opengl
 - **行走速度**：`0–200` 逻辑像素/秒，默认 `30`，在预览和桌宠中均生效。`0` 停止行走位移，但仍可播放行走动画。逻辑像素随系统 DPI 缩放，与底部高度使用的物理像素不同。
 - **交互式朝向翻转**：禁用、松开拖拽时（默认）、拖拽时、光标掠过时。角色跟随鼠标的水平移动方向，忽略微小抖动；“拖拽时”包含释放触发，“光标掠过时”包含拖拽和释放触发。关闭触摸和拖拽也会关闭交互翻转，屏幕边界的自动转向仍保留。
 
+Windows 和 macOS 桌面拖拽直接读取系统全局光标位置，避免窗口移动与缓存鼠标坐标不同步造成抖动和误抛掷。松手时保留实际拖动产生的惯性，并受最大速度限制；鼠标停稳后释放不会产生抛掷速度。
+
 ## 桌宠窗口、显示器与部署
 
 “行为与显示”的“桌面窗口”区域提供以下设置，修改后立即生效并随偏好保存：
 
-- **在任务栏和 Alt+Tab 中显示桌宠**：Windows、Linux 默认关闭，仅隐藏桌宠的系统条目，桌宠继续显示和播放动画。macOS 对应选项为“在 Dock 和应用切换器中显示”。切换不重建 GPU 资源，不重置位置、动作或暂停状态。
+- **在任务栏和 Alt+Tab 中显示桌宠**：Windows、Linux 默认关闭，仅隐藏桌宠的系统条目，桌宠继续显示和播放动画。macOS 对应选项为“在 Dock 和应用切换器中显示”，默认关闭；它独立控制整个 ArkPets 应用的 Dock 入口，与桌宠是否打开无关。切换不重建 GPU 资源，不重置位置、动作或暂停状态。
 - **自动检测任务栏高度**：Windows 默认开启，分别以各显示器的系统工作区为活动边界，定期刷新，适配任务栏和已向系统注册工作区的工具栏变化。
 - **任务栏高度（下边界距离）**：关闭自动检测后可输入 `0–500 px`，表示距屏幕底边的物理像素距离；`0` 为屏幕底边。例如底部工具栏高 `80 px` 时设置为 `80`，桌宠会落在该高度并沿其行走。这个值替换系统底部预留，不与任务栏高度累加。
 - **启用多显示屏**：默认开启。可拖拽到其他显示器，在有足够通行空间的相接屏幕间行走，并落到各自的底部边界。错位屏幕、屏幕之间的空隙会阻挡自动移动；拖拽可以直接放到另一块屏幕。关闭后限制在主显示器，拔掉显示器或改变布局时会把桌宠收回有效区域。
@@ -55,7 +57,9 @@ cargo run --release -- --renderer opengl
 
 - Windows 使用工具窗口样式，启动器的任务栏条目不受影响。
 - Linux 使用 X11 的 EWMH `SKIP_TASKBAR` / `SKIP_PAGER` 状态和 Utility 窗口类型；启动器不受影响，Alt+Tab 是否排除桌宠取决于窗口管理器。Wayland 会话下明确使用 XWayland，因为标准 `xdg-shell` 不提供任务栏排除或顶层窗口的全局定位接口。需要可用的 `DISPLAY` 和支持这些 EWMH 提示的窗口管理器；缺失时会报告错误。
-- macOS 使用 AppKit 的 Accessory 激活策略。Dock 和 Command+Tab 按应用管理，因此桌宠打开且此选项关闭时，整个 ArkPets 应用的系统入口都会隐藏，但启动器和桌宠窗口仍可见，动画照常运行。开启选项或收起桌宠后恢复 Regular 策略；桌宠不会因切换到其他应用而自动隐藏。
+- macOS 默认以 Accessory 激活策略启动，只保留菜单栏入口，不显示 Dock / Command+Tab 条目。开启 Dock 设置后使用 Regular 策略并显示应用自带的绿色爪印图标；再次关闭设置才会隐藏。启动、收起、再次启动桌宠均不切换此策略。修改 Dock 设置时会保留已有前台窗口及键盘焦点；隐藏或最小化的主界面不会因此弹出，桌宠不会因切换到其他应用而自动隐藏。
+
+macOS 运行期间，顶部菜单栏会常驻一个**爪印图标**，使用系统 `pawprint.fill` 模板图像适配浅色／深色菜单栏，不显示项目名文字；悬停提示为“ArkPets 桌宠”。隐藏 Dock 图标或收起桌宠后仍保留入口。点击可选择“显示主界面”“启动桌宠／收起桌宠”和“退出 ArkPets”。“启动桌宠／收起桌宠”保留主界面的隐藏或最小化状态，只有“显示主界面”会恢复窗口并切到前台。菜单中的开关文字与实际桌宠状态同步。退出会正常保存偏好并移除菜单栏入口。
 
 ## 模型与命令行
 
@@ -79,7 +83,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Spine 测试直接加载三个样例并验证动画顶点变化。GUI 测试覆盖不同窗口尺寸下的鼠标命中，避免初始化或最小化时出现 NaN；网格批处理测试检查绘制顺序、索引和混合颜色。运行时测试覆盖命令队列上限、每帧处理预算、参数校验和暂停。Linux 已在 WSL Debian 的 Xvfb/Openbox/合成器环境验证系统条目切换和动画；macOS 新增 AppKit 模块已通过 Apple Silicon、Intel 目标的类型检查，仍需实机验证窗口效果。
+Spine 测试直接加载三个样例并验证动画顶点变化。GUI 测试覆盖不同窗口尺寸下的鼠标命中，避免初始化或最小化时出现 NaN；网格批处理测试检查绘制顺序、索引和混合颜色。运行时测试覆盖命令队列上限、每帧处理预算、参数校验和暂停。Linux 已在 WSL Debian 的 Xvfb/Openbox/合成器环境验证系统条目切换和动画；macOS 提供独立的原生窗口回归，用于验证 Dock 策略切换时的启动器可见性和焦点。
 
 开发构建支持 `ARKPETS_CAPTURE_DIR` 环境变量，Windows 下设置后自动运行三个模型、两个主题、透明桌宠下落与行走的 GPU 截图检查，保存图片后退出。测试偏好写入该目录，不覆盖正常运行的偏好。以下脚本会放置受控背景，检查系统合成后的透明像素确实显示后方窗口，同时确认模型可见；仅验证 GPU 图片带 Alpha 无法排除原生窗口白底问题。
 
@@ -111,7 +115,47 @@ cargo build --bin arkpets-ui
 bash docs/scripts/Verify-ShellVisibility-Linux.sh target/debug/arkpets-ui target/linux-shell
 ```
 
+macOS 的回归直接调用应用使用的 AppKit 模块，检查反复切换 Dock 策略、关闭后再次创建窗口，以及已隐藏或最小化窗口的状态。销毁验证先恢复 Dock 策略、再销毁原生窗口，确认异步回调不会重新显示旧窗口，并覆盖桌宠持有焦点和 Dock 开关开启的关闭场景。脚本会打开测试窗口，并启动一个独立的临时窗口进程，验证应用处于后台时切换策略不会抢焦点；结束后自动关闭，不读写用户偏好。需要登录图形桌面，运行期间请勿切换应用或关闭测试窗口：
+
+```sh
+cargo run --locked --example verify-macos-shell-visibility
+```
+
+菜单栏回归会创建真实 `NSStatusItem`，触发原生菜单动作，检查显示／收起文字同步、隐藏 Dock 后入口仍可见，以及退出时释放菜单和回调。它同样需要图形桌面，且不读写用户偏好：
+
+```sh
+cargo run --locked --example verify-macos-menu-bar
+```
+
+实际 Metal UI 的生命周期回归覆盖主界面按钮和菜单栏两种入口，在 Dock 显示开／关两种设置下反复启动、收起和再次启动桌宠，并检查重新启动后的动画回调继续推进、Dock 策略及应用图标不变。它还会最小化、隐藏主界面，确认菜单只控制桌宠，且仅“显示主界面”会恢复主窗口。测试使用三个样例中的真实佩佩模型，并把偏好隔离到 `target/macos-menu-lifecycle/`：
+
+```sh
+cargo run --locked --example verify-macos-menu-lifecycle
+```
+
+预览回归不合成鼠标输入，检查桌宠打开时和单独预览时的连续回调与真实 GPU 动画像素，并覆盖最小化、隐藏、设置页、暂停及恢复。测试会打开原生窗口，请保持鼠标静止、不要操作测试窗口；截图和隔离配置保存在 `target/macos-preview/`：
+
+```sh
+cargo run --locked --example verify-macos-preview
+```
+
+macOS 拖拽回归会短暂打开并移动一个原生测试窗口，检查窗口内鼠标坐标尚未更新时，全局光标、桌宠位置和松手速度不受窗口移动影响。需要图形桌面，运行期间请保持鼠标静止；测试不移动系统鼠标，也不读写用户偏好：
+
+```sh
+cargo run --locked --example verify-macos-drag
+```
+
 ## 性能测量
+
+macOS 可用 Python 3 直接采样真实 Metal 窗口。默认场景为模型库和桌宠同时打开，`--page settings` 可比较设置页场景；需要登录图形桌面，采样时保持窗口可见且不要操作应用：
+
+```sh
+cargo build --locked --release --bin arkpets-ui
+python3 docs/scripts/measure_macos_performance.py --page library
+python3 docs/scripts/measure_macos_performance.py --page settings
+```
+
+脚本先预热 3 秒，再采样 12 秒，自动退出，将 `frames.json`、`process.json` 和日志保存到 `target/macos-performance/` 下的独立目录，偏好与日常运行隔离。可通过 `--executable`、`--model`、`--fps`、`--warmup`、`--duration` 和 `--output` 固定比较条件。`process.json` 使用 `ps` 的累计进程 CPU 时间计算采样期间的占用率（100% 表示一个逻辑核心），并记录进程常驻内存 RSS 和可执行文件哈希；RSS 不是显存占用。模型库场景同时播放预览与桌宠；设置页场景仅播放桌宠，两者绘制工作量不同。暂停时桌面工作区检查仍保持每秒一次，不在截止时间前反复唤醒。
 
 Windows 可用以下命令记录同一场景下的桌宠回调间隔和进程内存：
 
@@ -137,6 +181,6 @@ powershell -NoProfile -File docs/scripts/Measure-Performance.ps1 -DurationSecond
 
 ## 迁移范围
 
-当前是可运行的原生版本，尚未完全替代 Java 原版。系统托盘、开机启动、多宠 IPC、其他窗口边缘碰撞、联网模型管理、描边和阴影等仍未迁移。Linux 使用 X11/XWayland，尚不提供原生 Wayland 桌宠后端。完整调研、选型和功能边界见 [迁移记录](docs/MIGRATION.md)。
+当前是可运行的原生版本，尚未完全替代 Java 原版。macOS 已有菜单栏入口；Windows/Linux 系统托盘、开机启动、多宠 IPC、其他窗口边缘碰撞、联网模型管理、描边和阴影等仍未迁移。Linux 使用 X11/XWayland，尚不提供原生 Wayland 桌宠后端。完整调研、选型和功能边界见 [迁移记录](docs/MIGRATION.md)。
 
 本项目代码沿用 GPL-3.0；Spine 运行时、字体和明日方舟素材分别适用其自身许可与版权声明，见 [第三方说明](THIRD_PARTY_NOTICES.md)。

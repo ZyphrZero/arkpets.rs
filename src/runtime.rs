@@ -5,11 +5,41 @@ use std::sync::{
 
 use thiserror::Error;
 
-use crate::{Bounds, CharacterState, Direction, PetConfig};
+use crate::{config::EasingFunction, Bounds, CharacterState, Direction, PetConfig};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 64;
 pub const COMMANDS_PER_FRAME: usize = 16;
 const MAX_ANIMATION_NAME_BYTES: usize = 256;
+
+/// An atomic update of transition settings. Omitted fields retain their current values.
+/// Durations are seconds, with no rounding to UI presets. Animation mixing accepts
+/// 0–2 seconds; property transitions accept any finite, nonnegative duration.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TransitionUpdate {
+    pub animation_mix_duration: Option<f32>,
+    pub property_transition_duration: Option<f32>,
+    pub easing: Option<EasingFunction>,
+}
+
+impl TransitionUpdate {
+    fn validate(&self) -> Result<(), CommandError> {
+        for (field, value, maximum) in [
+            ("animation_mix_duration", self.animation_mix_duration, 2.0),
+            (
+                "property_transition_duration",
+                self.property_transition_duration,
+                f32::MAX,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !value.is_finite() || !(0.0..=maximum).contains(&value) {
+                    return Err(CommandError::InvalidConfig(field));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Commands are independent of the GUI and transport used to deliver them.
 #[derive(Debug, Clone)]
@@ -17,6 +47,7 @@ pub enum PetCommand {
     PlayAnimation(String),
     SetDirection(Direction),
     Configure(PetConfig),
+    ConfigureTransitions(TransitionUpdate),
     SetPaused(bool),
     SetAutomatic(bool),
     Interact,
@@ -27,6 +58,7 @@ pub enum CommandKind {
     PlayAnimation,
     SetDirection,
     Configure,
+    ConfigureTransitions,
     SetPaused,
     SetAutomatic,
     Interact,
@@ -38,6 +70,7 @@ impl PetCommand {
             Self::PlayAnimation(_) => CommandKind::PlayAnimation,
             Self::SetDirection(_) => CommandKind::SetDirection,
             Self::Configure(_) => CommandKind::Configure,
+            Self::ConfigureTransitions(_) => CommandKind::ConfigureTransitions,
             Self::SetPaused(_) => CommandKind::SetPaused,
             Self::SetAutomatic(_) => CommandKind::SetAutomatic,
             Self::Interact => CommandKind::Interact,
@@ -55,13 +88,35 @@ impl PetCommand {
                 if config.activity_level > 16 {
                     return Err(CommandError::InvalidConfig("activity_level"));
                 }
+                TransitionUpdate {
+                    animation_mix_duration: Some(config.animation_mix_duration),
+                    property_transition_duration: Some(config.property_transition_duration),
+                    easing: None,
+                }
+                .validate()?;
+                if !config.rendering.outline.width.is_finite()
+                    || !(0.0..=16.0).contains(&config.rendering.outline.width)
+                {
+                    return Err(CommandError::InvalidConfig("rendering.outline.width"));
+                }
+                if !config.rendering.canvas.coverage.is_finite()
+                    || !(0.0..=1.0).contains(&config.rendering.canvas.coverage)
+                {
+                    return Err(CommandError::InvalidConfig("rendering.canvas.coverage"));
+                }
+                if config.rendering.canvas.sampling_interval == 0 {
+                    return Err(CommandError::InvalidConfig(
+                        "rendering.canvas.sampling_interval",
+                    ));
+                }
                 for (field, value) in [
                     ("walk_speed", config.walk_speed),
                     ("physics.gravity", config.physics.gravity),
+                    ("physics.air_friction", config.physics.air_friction),
+                    ("physics.ground_friction", config.physics.ground_friction),
                     ("physics.max_velocity.x", config.physics.max_velocity.x),
                     ("physics.max_velocity.y", config.physics.max_velocity.y),
                     ("physics.min_velocity", config.physics.min_velocity),
-                    ("transition_duration", config.transition_duration),
                 ] {
                     if !value.is_finite() || value < 0.0 {
                         return Err(CommandError::InvalidConfig(field));
@@ -72,6 +127,7 @@ impl PetCommand {
                     ("physics.bounce_damping", config.physics.bounce_damping),
                     ("opacity_normal", config.opacity_normal),
                     ("opacity_dim", config.opacity_dim),
+                    ("rendering.shadow_opacity", config.rendering.shadow_opacity),
                 ] {
                     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                         return Err(CommandError::InvalidConfig(field));
@@ -82,6 +138,7 @@ impl PetCommand {
                 }
                 Ok(())
             }
+            Self::ConfigureTransitions(update) => update.validate(),
             _ => Ok(()),
         }
     }
@@ -197,6 +254,19 @@ impl PetRuntime {
             }
             PetCommand::SetDirection(direction) => self.character.set_direction(direction),
             PetCommand::Configure(config) => self.character.configure(config),
+            PetCommand::ConfigureTransitions(update) => {
+                let mut config = self.character.config().clone();
+                if let Some(duration) = update.animation_mix_duration {
+                    config.animation_mix_duration = duration;
+                }
+                if let Some(duration) = update.property_transition_duration {
+                    config.property_transition_duration = duration;
+                }
+                if let Some(easing) = update.easing {
+                    config.easing = easing;
+                }
+                self.character.configure(config);
+            }
             PetCommand::SetPaused(paused) => self.paused = paused,
             PetCommand::SetAutomatic(automatic) => self.automatic = automatic,
             PetCommand::Interact => {
@@ -311,9 +381,192 @@ mod tests {
     }
 
     #[test]
+    fn transition_updates_are_precise_independent_and_preserve_running_state() {
+        let mut runtime = runtime();
+        runtime
+            .apply(PetCommand::Configure(PetConfig {
+                walk_speed: 73.0,
+                opacity_normal: 0.8,
+                ..Default::default()
+            }))
+            .unwrap();
+        runtime
+            .apply(PetCommand::PlayAnimation("Move".into()))
+            .unwrap();
+        runtime.tick(0.25, Bounds::new(1000.0, 500.0));
+        runtime.apply(PetCommand::SetPaused(true)).unwrap();
+        runtime.apply(PetCommand::SetAutomatic(false)).unwrap();
+        let snapshot = runtime.character().to_json().unwrap();
+        let mut expected = runtime.character().config().clone();
+        let sender = runtime.command_sender();
+        for update in [
+            TransitionUpdate {
+                animation_mix_duration: Some(0.137),
+                ..Default::default()
+            },
+            TransitionUpdate {
+                property_transition_duration: Some(0.423),
+                easing: Some(EasingFunction::Linear),
+                ..Default::default()
+            },
+        ] {
+            sender
+                .try_send(PetCommand::ConfigureTransitions(update))
+                .unwrap();
+            let mut events = Vec::new();
+            assert_eq!(runtime.drain_commands(|event| events.push(event)), 1);
+            assert_eq!(
+                events,
+                [PetEvent {
+                    command: CommandKind::ConfigureTransitions,
+                    result: Ok(())
+                }]
+            );
+            if let Some(duration) = update.animation_mix_duration {
+                expected.animation_mix_duration = duration;
+            }
+            if let Some(duration) = update.property_transition_duration {
+                expected.property_transition_duration = duration;
+            }
+            if let Some(easing) = update.easing {
+                expected.easing = easing;
+            }
+            assert_eq!(
+                serde_json::to_value(runtime.character().config()).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(runtime.character().to_json().unwrap(), snapshot);
+            assert!(runtime.paused());
+            assert!(!runtime.automatic());
+        }
+    }
+
+    #[test]
+    fn invalid_transition_updates_are_rejected_atomically_at_both_entry_points() {
+        let mut runtime = runtime();
+        let sender = runtime.command_sender();
+        let original = serde_json::to_value(runtime.character().config()).unwrap();
+        for (field, invalid) in [
+            ("animation_mix_duration", -0.1),
+            ("animation_mix_duration", 2.001),
+            ("animation_mix_duration", f32::INFINITY),
+            ("animation_mix_duration", f32::NAN),
+            ("property_transition_duration", -0.1),
+            ("property_transition_duration", f32::INFINITY),
+            ("property_transition_duration", f32::NAN),
+        ] {
+            let mut update = TransitionUpdate {
+                animation_mix_duration: Some(0.137),
+                property_transition_duration: Some(0.423),
+                easing: Some(EasingFunction::Linear),
+            };
+            if field == "animation_mix_duration" {
+                update.animation_mix_duration = Some(invalid);
+            } else {
+                update.property_transition_duration = Some(invalid);
+            }
+            let command = PetCommand::ConfigureTransitions(update);
+            assert!(
+                matches!(sender.try_send(command.clone()), Err(SubmitError::Invalid(CommandError::InvalidConfig(actual))) if actual == field)
+            );
+            assert_eq!(
+                runtime.apply(command),
+                Err(CommandError::InvalidConfig(field))
+            );
+            assert_eq!(
+                serde_json::to_value(runtime.character().config()).unwrap(),
+                original
+            );
+        }
+        assert_eq!(
+            runtime.drain_commands(|_| panic!("invalid command entered queue")),
+            0
+        );
+        for duration in [0.0, 2.0] {
+            runtime
+                .apply(PetCommand::ConfigureTransitions(TransitionUpdate {
+                    animation_mix_duration: Some(duration),
+                    property_transition_duration: Some(duration),
+                    ..Default::default()
+                }))
+                .unwrap();
+            assert_eq!(
+                runtime.character().config().animation_mix_duration,
+                duration
+            );
+            assert_eq!(
+                runtime.character().config().property_transition_duration,
+                duration
+            );
+        }
+    }
+
+    #[test]
     fn invalid_commands_never_enter_the_queue_or_mutate_state() {
         let mut runtime = runtime();
         let sender = runtime.command_sender();
+        for duration in [-0.1, f32::NAN, f32::INFINITY] {
+            let command = PetCommand::Configure(PetConfig {
+                property_transition_duration: duration,
+                ..Default::default()
+            });
+            assert!(matches!(
+                sender.try_send(command.clone()),
+                Err(SubmitError::Invalid(CommandError::InvalidConfig(
+                    "property_transition_duration"
+                )))
+            ));
+            assert_eq!(
+                runtime.apply(command),
+                Err(CommandError::InvalidConfig("property_transition_duration"))
+            );
+        }
+        for value in [-1.0, f32::NAN, f32::INFINITY] {
+            for field in ["physics.air_friction", "physics.ground_friction"] {
+                let mut config = PetConfig::default();
+                if field == "physics.air_friction" {
+                    config.physics.air_friction = value;
+                } else {
+                    config.physics.ground_friction = value;
+                }
+                assert_eq!(
+                    runtime.apply(PetCommand::Configure(config)),
+                    Err(CommandError::InvalidConfig(field))
+                );
+            }
+        }
+        assert_eq!(
+            runtime.apply(PetCommand::Configure(PetConfig {
+                animation_mix_duration: 2.1,
+                ..Default::default()
+            })),
+            Err(CommandError::InvalidConfig("animation_mix_duration"))
+        );
+        for (field, value) in [
+            ("rendering.outline.width", f32::NAN),
+            ("rendering.outline.width", 17.0),
+            ("rendering.shadow_opacity", 1.1),
+            ("rendering.canvas.coverage", f32::INFINITY),
+        ] {
+            let mut config = PetConfig::default();
+            match field {
+                "rendering.outline.width" => config.rendering.outline.width = value,
+                "rendering.shadow_opacity" => config.rendering.shadow_opacity = value,
+                _ => config.rendering.canvas.coverage = value,
+            }
+            assert_eq!(
+                runtime.apply(PetCommand::Configure(config)),
+                Err(CommandError::InvalidConfig(field))
+            );
+        }
+        let mut config = PetConfig::default();
+        config.rendering.canvas.sampling_interval = 0;
+        assert_eq!(
+            runtime.apply(PetCommand::Configure(config)),
+            Err(CommandError::InvalidConfig(
+                "rendering.canvas.sampling_interval"
+            ))
+        );
         assert!(matches!(
             sender.try_send(PetCommand::Configure(PetConfig {
                 activity_level: 17,

@@ -179,8 +179,8 @@ try {
         $next = if ($current -eq 'dx12') { 'opengl' } else { 'dx12' }
         $timer.Restart()
         # The settings page must survive each switch; select without an Apply button.
-        Click-Client $root 300 701
-        $row = if ($next -eq 'dx12') { 739 } else { 781 }
+        Click-Client $root 300 827
+        $row = if ($next -eq 'dx12') { 866 } else { 908 }
         Click-Client $root 300 $row
         $root = Wait-Window $false $root
         Show-Root $root

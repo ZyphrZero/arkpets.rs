@@ -6,7 +6,7 @@ use arkpets::{
     interaction::DirectionGesture, Bounds, Direction, PetConfig, PhysicsState, Vec2 as PetVec2,
 };
 use eframe::egui::{Context, Pos2, Rect, Vec2};
-use std::{io, time::Instant};
+use std::{collections::VecDeque, io, time::Instant};
 
 pub struct DesktopMotion {
     pub body: PhysicsState,
@@ -23,6 +23,7 @@ pub struct DesktopMotion {
     areas: Vec<Rect>,
     drag_offset: Vec2,
     initial_position: Option<[f32; 2]>,
+    display_waypoints: VecDeque<Pos2>,
 }
 
 impl DesktopMotion {
@@ -44,6 +45,7 @@ impl DesktopMotion {
             areas: vec![work_area],
             drag_offset: Vec2::ZERO,
             initial_position: None,
+            display_waypoints: VecDeque::new(),
         }
     }
 
@@ -110,6 +112,16 @@ impl DesktopMotion {
         let ratio = self.pixels_per_point / scale;
         self.body.velocity.x *= ratio;
         self.body.velocity.y *= ratio;
+        if self.areas != areas || self.size != size || self.pixels_per_point != scale {
+            self.display_waypoints.clear();
+            if self.last_window_position.is_some_and(|previous| {
+                regions::waypoints(previous * ratio, projected, size, &areas).is_none()
+            }) {
+                // Resizing or removing a screen can move the physical target
+                // into another component; an old tween cannot traverse that gap.
+                self.last_window_position = None;
+            }
+        }
         self.work_area = area;
         self.areas = areas;
         self.size = size;
@@ -128,6 +140,93 @@ impl DesktopMotion {
         self.drag_offset = (cursor - self.screen_position()) / size;
         self.body.start_drag(self.local_cursor(cursor));
         self.gesture.start_drag(cursor.x * self.pixels_per_point);
+    }
+
+    pub fn start_drag_from_window(&mut self, cursor: Pos2, origin: Pos2, size: Vec2) {
+        // Physical motion may lead the eased window. Anchor dragging to what the
+        // user actually grabbed, so starting a drag cannot jump to the target.
+        self.body.position = self.local_cursor(self.constrain_display_position(origin, size));
+        self.start_drag(cursor, size);
+    }
+
+    pub fn constrain_display_position(&self, position: Pos2, size: Vec2) -> Pos2 {
+        regions::project(position, size, &self.areas)
+            .expect("validated desktop regions contain the pet")
+    }
+
+    pub fn display_target(&mut self, size: Vec2, snap: bool) -> io::Result<(Pos2, bool)> {
+        let goal = self.screen_position();
+        let Some(previous) = self
+            .last_window_position
+            .filter(|&p| regions::covered(Rect::from_min_size(p, size), &self.areas))
+        else {
+            self.display_waypoints.clear();
+            return Ok((goal, false));
+        };
+        if snap
+            || regions::covered(
+                Rect::from_min_size(previous, size).union(Rect::from_min_size(goal, size)),
+                &self.areas,
+            )
+        {
+            let reset = !self.display_waypoints.is_empty();
+            self.display_waypoints.clear();
+            return Ok((goal, reset));
+        }
+        let mut reset = false;
+        while let Some(point) = self.display_waypoints.front().copied() {
+            let aligned = self.display_position(point, size, self.pixels_per_point, true)?;
+            if aligned.distance(previous) > 0.001 {
+                break;
+            }
+            self.display_waypoints.pop_front();
+            reset = true;
+        }
+        if self.display_waypoints.is_empty() {
+            let mut route = regions::waypoints(previous, goal, size, &self.areas)
+                .ok_or_else(|| io::Error::other("显示位置无法沿当前屏幕布局到达物理目标"))?;
+            // Keep only turns; the final moving target is always read from physics.
+            route.pop();
+            self.display_waypoints = route.into();
+            reset = true;
+        }
+        Ok((
+            self.display_waypoints.front().copied().unwrap_or(goal),
+            reset,
+        ))
+    }
+
+    pub fn display_position(
+        &self,
+        target: Pos2,
+        size: Vec2,
+        scale: f32,
+        snap: bool,
+    ) -> io::Result<Pos2> {
+        let position = if let Some(previous) = self
+            .last_window_position
+            .filter(|&p| !snap && regions::covered(Rect::from_min_size(p, size), &self.areas))
+        {
+            // Sweep along the union instead of jumping between the nearest
+            // projections on either side of an L-shaped screen corner.
+            regions::travel(previous, target, size, &self.areas)
+        } else {
+            self.constrain_display_position(target, size)
+        };
+        let pixels = position * scale;
+        let low = pixels.floor();
+        let high = pixels.ceil();
+        [
+            Pos2::new(low.x, low.y),
+            Pos2::new(low.x, high.y),
+            Pos2::new(high.x, low.y),
+            Pos2::new(high.x, high.y),
+        ]
+        .into_iter()
+        .map(|p| p / scale)
+        .filter(|&p| regions::covered(Rect::from_min_size(p, size), &self.areas))
+        .min_by(|a, b| a.distance_sq(position).total_cmp(&b.distance_sq(position)))
+        .ok_or_else(|| io::Error::other("桌宠尺寸无法对齐到当前屏幕像素边界，请减小显示比例"))
     }
 
     pub fn drag_to(&mut self, cursor: Pos2, dt: f32, size: Vec2, limit: PetVec2) {
@@ -157,12 +256,15 @@ impl DesktopMotion {
     ) {
         let before = self.screen_position();
         let bounds = Bounds::new(self.work_area.width(), self.work_area.height());
-        self.body.step(
+        let probe = regions::travel(before, before + Vec2::new(0.0, 1.0), size, &self.areas);
+        let grounded = probe.y - before.y < 0.01;
+        self.body.step_with_ground_contact(
             dt,
             bounds,
             PetVec2::new(size.x, size.y),
             config.physics,
             (moving && config.allow_walk).then_some((*direction, config.walk_speed)),
+            grounded,
         );
         let requested = self.screen_position();
         let position = regions::travel(before, requested, size, &self.areas);
@@ -504,6 +606,155 @@ mod tests {
         assert_eq!(motion.screen_position(), cursor - Vec2::new(25.0, 30.0));
         motion.drag_to(cursor, 0.1, size, config.physics.max_velocity);
         assert_eq!(motion.body.velocity, PetVec2::ZERO);
+    }
+
+    #[test]
+    fn local_monitor_floor_applies_friction_above_the_union_floor() {
+        let left = Rect::from_min_max(Pos2::new(-1000.0, 0.0), Pos2::new(0.0, 800.0));
+        let right = Rect::from_min_max(Pos2::new(0.0, 200.0), Pos2::new(1200.0, 1000.0));
+        let size = Vec2::new(100.0, 100.0);
+        let config = PetConfig {
+            physics: arkpets::PhysicsConfig {
+                gravity: 0.0,
+                air_friction: 100.0,
+                ground_friction: 500.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut motion =
+            DesktopMotion::deploy(vec![left, right], left, size, [0.5, 1.0], 1.0).unwrap();
+        motion.body.velocity = PetVec2::new(100.0, 0.0);
+        motion.step(0.1, size, &config, false, &mut Direction::Right);
+        assert!((motion.body.velocity.x - 40.0).abs() < 0.001);
+        assert_eq!(motion.screen_position().y, 700.0);
+        motion.body.position.y -= 50.0;
+        motion.body.velocity = PetVec2::new(100.0, 0.0);
+        motion.step(0.1, size, &config, false, &mut Direction::Right);
+        assert!((motion.body.velocity.x - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dragging_an_eased_window_starts_from_the_displayed_origin() {
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0));
+        let size = Vec2::new(100.0, 100.0);
+        let mut motion = DesktopMotion::deploy(vec![area], area, size, [0.8, 0.8], 1.0).unwrap();
+        let origin = Pos2::new(200.0, 200.0);
+        let cursor = origin + Vec2::new(30.0, 40.0);
+        motion.start_drag_from_window(cursor, origin, size);
+        motion.drag_to(cursor, 0.01, size, PetVec2::new(1000.0, 1000.0));
+        assert_eq!(motion.screen_position(), origin);
+        assert_eq!(motion.body.velocity, PetVec2::ZERO);
+        motion.body.end_drag();
+        assert_eq!(motion.body.velocity, PetVec2::ZERO);
+    }
+
+    #[test]
+    fn resized_canvas_recovers_when_only_another_screen_can_hold_the_target() {
+        let left = Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 400.0));
+        let right = Rect::from_min_size(Pos2::new(600.0, 0.0), Vec2::new(400.0, 400.0));
+        let mut motion =
+            DesktopMotion::deploy(vec![left, right], left, Vec2::splat(100.0), [1.0, 0.0], 1.0)
+                .unwrap();
+        motion.last_window_position = Some(Pos2::ZERO);
+        motion
+            .set_areas(vec![left, right], Vec2::new(400.0, 100.0), 1.0)
+            .unwrap();
+        assert_eq!(motion.screen_position(), Pos2::new(600.0, 0.0));
+        assert!(motion.last_window_position.is_none());
+        assert_eq!(
+            motion
+                .display_target(Vec2::new(400.0, 100.0), false)
+                .unwrap()
+                .0,
+            motion.screen_position()
+        );
+    }
+
+    #[test]
+    fn display_motion_sweeps_screen_corners_and_rounds_inward() {
+        let a = Rect::from_min_max(Pos2::ZERO, Pos2::new(400.0, 600.0));
+        let b = Rect::from_min_max(Pos2::new(400.0, 400.0), Pos2::new(800.0, 1000.0));
+        let size = Vec2::splat(100.0);
+        let mut motion = DesktopMotion::deploy(vec![a, b], a, size, [0.0, 0.0], 1.0).unwrap();
+        motion.last_window_position = Some(Pos2::new(300.0, 370.0));
+        assert_eq!(
+            motion
+                .display_position(Pos2::new(330.0, 370.1), size, 1.0, false)
+                .unwrap(),
+            Pos2::new(300.0, 370.0)
+        );
+        let corner = motion
+            .display_position(Pos2::new(330.0, 400.1), size, 1.0, false)
+            .unwrap();
+        assert_eq!(corner, Pos2::new(300.0, 400.0));
+        motion.last_window_position = Some(corner);
+        assert_eq!(
+            motion
+                .display_position(Pos2::new(331.0, 401.0), size, 1.0, false)
+                .unwrap(),
+            Pos2::new(331.0, 401.0)
+        );
+        // Rounding may not push a fractional-sized pet outside the screen.
+        let size = Vec2::new(100.3, 100.3);
+        motion.last_window_position = None;
+        let p = motion
+            .display_position(Pos2::new(299.7, 100.0), size, 1.5, false)
+            .unwrap();
+        assert!(p.x + size.x <= a.right());
+        assert_eq!(p.x * 1.5, (p.x * 1.5).round());
+        // User dragging can still cross the gap between disconnected screens.
+        let gap = Rect::from_min_max(Pos2::new(900.0, 0.0), Pos2::new(1400.0, 600.0));
+        motion
+            .set_areas(vec![a, gap], Vec2::splat(100.0), 1.0)
+            .unwrap();
+        motion.last_window_position = Some(Pos2::new(100.0, 100.0));
+        assert_eq!(
+            motion
+                .display_position(Pos2::new(1000.0, 100.0), Vec2::splat(100.0), 1.0, true)
+                .unwrap(),
+            Pos2::new(1000.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn eased_display_follows_turns_around_a_three_screen_notch() {
+        let a = Rect::from_min_max(Pos2::ZERO, Pos2::new(400.0, 1000.0));
+        let b = Rect::from_min_max(Pos2::new(400.0, 0.0), Pos2::new(800.0, 300.0));
+        let c = Rect::from_min_max(Pos2::new(800.0, 0.0), Pos2::new(1200.0, 1000.0));
+        let size = Vec2::splat(100.0);
+        let areas = vec![a, b, c];
+        let mut motion = DesktopMotion::deploy(areas.clone(), a, size, [0.0, 0.0], 1.0).unwrap();
+        let goal = Pos2::new(800.0, 600.0);
+        motion.body.position = motion.local_cursor(goal);
+        let mut displayed = Pos2::new(300.0, 600.0);
+        motion.last_window_position = Some(displayed);
+        let mut presentation = crate::ui::transition::Presentation::default();
+        let config = PetConfig {
+            property_transition_duration: 0.3,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        presentation.reset_position(displayed, start);
+        let mut reached_corridor = false;
+        for frame in 0..180 {
+            let now = start + std::time::Duration::from_secs_f32(frame as f32 / 60.0);
+            let (target, reset) = motion.display_target(size, false).unwrap();
+            if reset {
+                presentation.reset_position(displayed, now);
+            }
+            let (next, _) = presentation.position(target, false, &config, now);
+            let next = motion.display_position(next, size, 1.0, false).unwrap();
+            assert!(regions::covered(
+                Rect::from_min_size(displayed, size).union(Rect::from_min_size(next, size)),
+                &areas
+            ));
+            reached_corridor |= next.y <= 200.0;
+            displayed = next;
+            motion.last_window_position = Some(displayed);
+        }
+        assert!(reached_corridor);
+        assert_eq!(displayed, goal);
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]

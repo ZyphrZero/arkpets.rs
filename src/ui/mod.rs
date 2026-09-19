@@ -1,7 +1,9 @@
 mod backend;
 mod desktop;
+mod effects;
 #[cfg(target_os = "macos")]
 mod menu_bar;
+mod opacity;
 mod performance;
 #[cfg(windows)]
 mod platform;
@@ -9,11 +11,14 @@ mod renderer;
 mod shell_visibility;
 #[cfg(debug_assertions)]
 mod smoke;
+mod transition;
 
 use arkpets::{
-    interaction::DirectionGesture, runtime::CommandKind, Bounds, CharacterModel, CharacterState,
-    Direction, DirectionSwitching, ModelCatalog, PetCommand, PetConfig, PetRuntime,
-    Vec2 as PetVec2,
+    config::{EasingFunction, OutlineCondition},
+    interaction::DirectionGesture,
+    runtime::CommandKind,
+    Bounds, CharacterModel, CharacterState, Direction, DirectionSwitching, ModelCatalog,
+    PetCommand, PetConfig, PetRuntime, TransitionPreset, Vec2 as PetVec2,
 };
 use backend::RendererBackend;
 use eframe::egui::{
@@ -105,6 +110,7 @@ pub struct App {
     prefs: Preferences,
     runtime: Option<PetRuntime>,
     renderer: Option<Renderer>,
+    compositor: renderer::Compositor,
     selected: usize,
     search: String,
     favorites: Vec<String>,
@@ -115,6 +121,12 @@ pub struct App {
     import_path: String,
     desktop_open: bool,
     desktop_motion: Option<desktop::DesktopMotion>,
+    desktop_opacity: Option<opacity::OpacityFade>,
+    desktop_presentation: transition::Presentation,
+    preview_presentation: transition::Presentation,
+    preview_properties_animating: bool,
+    preview_effects: effects::EffectState,
+    desktop_effects: effects::EffectState,
     last_frame: Instant,
     next_frame: Instant,
     preview_next_frame: Instant,
@@ -163,6 +175,7 @@ impl App {
             prefs,
             runtime: None,
             renderer: None,
+            compositor: renderer::Compositor::new(cc),
             selected: 0,
             search: String::new(),
             favorites: cc
@@ -176,6 +189,12 @@ impl App {
             import_path: String::new(),
             desktop_open: false,
             desktop_motion: None,
+            desktop_opacity: None,
+            desktop_presentation: transition::Presentation::default(),
+            preview_presentation: transition::Presentation::default(),
+            preview_properties_animating: false,
+            preview_effects: effects::EffectState::default(),
+            desktop_effects: effects::EffectState::default(),
             last_frame: Instant::now(),
             next_frame: Instant::now(),
             preview_next_frame: Instant::now(),
@@ -224,9 +243,7 @@ impl App {
         backend: RendererBackend,
     ) -> Result<(), String> {
         configure_fonts(&cc.egui_ctx);
-        if let Some(renderer) = &mut self.renderer {
-            renderer.rebind_textures(&cc.egui_ctx)?;
-        }
+        self.compositor = renderer::Compositor::new(cc);
         self.theme(&cc.egui_ctx);
         self.theme_applied = false;
         self.backend = backend;
@@ -294,10 +311,11 @@ impl App {
 
     fn select(&mut self, index: usize, ctx: &egui::Context) {
         let model = self.catalog.models[index].clone();
-        match Renderer::load(ctx, &model, &self.asset_root) {
+        match Renderer::load(&model, &self.asset_root, self.prefs.config.rendering.canvas) {
             Ok(renderer) => self.install_model(index, model, renderer),
             Err(error) => self.error = Some(error),
         }
+        ctx.request_repaint();
     }
 
     fn install_model(&mut self, index: usize, mut model: CharacterModel, renderer: Renderer) {
@@ -327,6 +345,10 @@ impl App {
             self.runtime = Some(runtime);
         }
         self.renderer = Some(renderer);
+        self.preview_presentation = transition::Presentation::default();
+        self.desktop_presentation = transition::Presentation::default();
+        self.preview_effects = effects::EffectState::default();
+        self.desktop_effects = effects::EffectState::default();
         self.first_position = true;
         self.error = None;
     }
@@ -336,7 +358,11 @@ impl App {
             let character = runtime.character();
             let name = &character.animation().animation;
             if force || name != &self.animation_name {
-                match renderer.spine.play(name, name != "Interact") {
+                match renderer.spine.play_with_mix(
+                    name,
+                    name != "Interact",
+                    self.prefs.config.animation_mix_duration,
+                ) {
                     Ok(()) => self.animation_name = name.clone(),
                     Err(error) => self.error = Some(error.to_string()),
                 }
@@ -379,7 +405,7 @@ impl App {
         self.sync_animation(force);
         if !self.paused() && dt > 0.0 {
             if let Some(renderer) = &mut self.renderer {
-                match renderer.update(dt, self.prefs.config.transition_duration) {
+                match renderer.update(dt, self.prefs.config.animation_mix_duration) {
                     Ok(true) => {
                         if let Some(runtime) = &mut self.runtime {
                             if !runtime.character().physics().dragging
@@ -651,11 +677,19 @@ impl App {
                         .suffix(" x"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.prefs.config.opacity_normal, 0.15..=1.0)
+                    egui::Slider::new(&mut self.prefs.config.opacity_normal, 0.1..=1.0)
                         .text("不透明度"),
                 );
                 ui.checkbox(&mut self.prefs.always_on_top, "桌宠置顶");
-                ui.checkbox(&mut self.prefs.click_through, "桌宠鼠标穿透");
+                if ui
+                    .checkbox(&mut self.prefs.click_through, "透明模式（鼠标穿透）")
+                    .on_hover_text(
+                        "使用透明模式不透明度，鼠标可操作桌宠后方的窗口；可在主界面关闭。",
+                    )
+                    .changed()
+                {
+                    ctx.request_repaint_of(desktop_id());
+                }
                 ui.add_space(16.0);
                 ui.separator();
                 if let Some(renderer) = &self.renderer {
@@ -686,6 +720,8 @@ impl App {
     fn preview(&mut self, root_ui: &mut egui::Ui, dt: f32) {
         let ctx = root_ui.ctx().clone();
         let paused = self.paused();
+        self.preview_properties_animating = false;
+        let now = Instant::now();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(root_ui.visuals().panel_fill))
             .show(root_ui, |ui| {
@@ -748,11 +784,13 @@ impl App {
                 let character = runtime.character_mut();
                 let height = (240.0 * self.prefs.config.display_scale).min(rect.height() * 0.7);
                 let mut size = renderer.size(height);
-                if size.x > rect.width() - 40.0 {
-                    size *= (rect.width() - 40.0).max(1.0) / size.x;
-                }
+                let fit = ((rect.width() - 40.0) / size.x)
+                    .min((rect.height() - 100.0) / size.y)
+                    .min(1.0);
+                size *= fit;
                 character.resize(PetVec2::new(size.x, size.y));
                 let bounds = Bounds::new(rect.width(), (rect.height() - 70.0).max(size.y));
+                character.set_position(character.position(), bounds);
                 if self.first_position {
                     character.set_position(
                         PetVec2::new((rect.width() - size.x) * 0.5, bounds.height - size.y),
@@ -769,19 +807,29 @@ impl App {
                 }
                 self.preview_direction = character.animation().direction;
                 let p = character.position();
-                let target = Rect::from_min_size(rect.min + Vec2::new(p.x, p.y), size);
+                let (visual_position, _) = self.preview_presentation.position(
+                    Pos2::new(p.x, p.y),
+                    character.physics().dragging,
+                    &self.prefs.config,
+                    now,
+                );
+                let mut target = Rect::from_min_size(rect.min + visual_position.to_vec2(), size);
                 let response = ui.interact(target, ui.id().with("pet"), Sense::click_and_drag());
                 let mut force = false;
                 if response.clicked() {
                     force |= character.click();
                 }
-                if response.drag_started() {
+                if response.drag_started() && self.prefs.config.allow_drag {
                     if let Some(point) = ctx.input(|input| input.pointer.press_origin()) {
+                        character.set_position(
+                            PetVec2::new(visual_position.x, visual_position.y),
+                            bounds,
+                        );
                         character
                             .start_drag(PetVec2::new(point.x - rect.left(), point.y - rect.top()));
                         self.preview_gesture
                             .start_drag(point.x * ctx.pixels_per_point());
-                        force = true;
+                        force |= self.prefs.config.allow_interact;
                     }
                 }
                 if response.dragged() {
@@ -808,13 +856,36 @@ impl App {
                     }
                 }
                 self.preview_direction = character.animation().direction;
+                let p = character.position();
+                let (visual_position, moving) = self.preview_presentation.position(
+                    Pos2::new(p.x, p.y),
+                    character.physics().dragging,
+                    &self.prefs.config,
+                    now,
+                );
+                target.min = rect.min + visual_position.to_vec2();
+                target.max = target.min + size;
+                let (facing, turning) = self.preview_presentation.facing(
+                    character.animation().direction,
+                    &self.prefs.config,
+                    now,
+                );
+                self.preview_properties_animating = moving || turning;
+                let (effect, outline_animating) = self.preview_effects.update(
+                    &self.prefs.config,
+                    effects::Input {
+                        dragging: character.physics().dragging,
+                        pressing: response.is_pointer_button_down_on(),
+                        focused: ctx.input(|input| input.viewport().focused.unwrap_or(false)),
+                        controlled: !self.prefs.automatic,
+                    },
+                    self.prefs.config.opacity_normal,
+                    ctx.pixels_per_point(),
+                    now,
+                );
+                self.preview_properties_animating |= outline_animating;
                 if !character.is_hidden() {
-                    renderer.paint(
-                        &painter,
-                        target,
-                        character.animation().direction,
-                        self.prefs.config.opacity_normal,
-                    );
+                    renderer.paint_with_facing(&painter, target, facing, effect, &self.compositor);
                 }
                 if self.desktop_open {
                     character.set_direction(desktop_direction);
@@ -842,7 +913,11 @@ impl App {
                 ui.checkbox(&mut self.prefs.config.allow_sit, "允许坐下");
                 ui.checkbox(&mut self.prefs.config.allow_sleep, "允许睡眠");
                 ui.checkbox(&mut self.prefs.config.allow_special, "允许特殊动作");
-                ui.checkbox(&mut self.prefs.config.allow_interact, "允许触摸和拖拽");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.prefs.config.allow_interact, "允许触发交互动画")
+                        .on_hover_text("关闭点击和自动选择的 Interact 动画；仍可手动播放，拖拽和翻转独立设置。");
+                    ui.checkbox(&mut self.prefs.config.allow_drag, "允许拖拽");
+                });
                 ui.add(
                     egui::Slider::new(&mut self.prefs.config.walk_speed, 0.0..=200.0)
                         .text("行走速度")
@@ -886,16 +961,33 @@ impl App {
                 ui.heading("物理");
                 ui.add(
                     egui::Slider::new(&mut self.prefs.config.physics.gravity, 0.0..=2000.0)
-                        .text("重力"),
+                        .text("重力加速度").suffix(" 逻辑像素/秒²"),
                 );
-                ui.add(
-                    egui::Slider::new(&mut self.prefs.config.physics.drag, 0.8..=1.0)
-                        .text("惯性保留"),
-                );
+                let friction_changed = ui.add(
+                    egui::Slider::new(&mut self.prefs.config.physics.air_friction, 0.0..=2000.0)
+                        .text("空气阻力加速度").suffix(" 逻辑像素/秒²"),
+                ).on_hover_text("在空中和地面持续减速，速度降到零后不会反向。").changed();
+                let friction_changed = ui.add(
+                    egui::Slider::new(&mut self.prefs.config.physics.ground_friction, 0.0..=2000.0)
+                        .text("地面摩擦加速度").suffix(" 逻辑像素/秒²"),
+                ).on_hover_text("接触当前屏幕底边时，额外减小水平惯性。").changed() || friction_changed;
+                if friction_changed {
+                    self.prefs.config.physics.drag = 1.0;
+                    self.prefs.config.physics.min_velocity = 0.0;
+                }
+                ui.add(egui::Slider::new(&mut self.prefs.config.physics.max_velocity.x, 0.0..=2000.0)
+                    .text("最大水平运动速率").suffix(" 逻辑像素/秒"))
+                    .on_hover_text("限制惯性和拖拽释放速度；0 停止水平惯性，行走速度独立设置。");
+                ui.add(egui::Slider::new(&mut self.prefs.config.physics.max_velocity.y, 0.0..=2000.0)
+                    .text("最大垂直运动速率").suffix(" 逻辑像素/秒"))
+                    .on_hover_text("限制下落和拖拽释放速度；0 停止垂直惯性。");
                 ui.add(
                     egui::Slider::new(&mut self.prefs.config.physics.bounce_damping, 0.0..=1.0)
                         .text("反弹系数"),
                 );
+                if self.prefs.config.physics.drag != 1.0 || self.prefs.config.physics.min_velocity != 0.0 {
+                    ui.small("当前保留旧惯性参数；调整空气阻力或地面摩擦后，改用加速度减速。");
+                }
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(12.0);
@@ -931,10 +1023,6 @@ impl App {
                         Err(error) => self.error = Some(error),
                     }
                 }
-                ui.add(
-                    egui::Slider::new(&mut self.prefs.config.transition_duration, 0.0..=1.0)
-                        .text("动作混合 / 秒"),
-                );
                 egui::ComboBox::from_label("帧率上限")
                     .selected_text(self.prefs.fps.to_string())
                     .show_ui(ui, |ui| {
@@ -942,10 +1030,156 @@ impl App {
                             ui.selectable_value(&mut self.prefs.fps, fps, fps.to_string());
                         }
                     });
+                let mut opacity_changed = ui
+                    .add(
+                        egui::Slider::new(&mut self.prefs.config.opacity_normal, 0.1..=1.0)
+                            .text("常规不透明度"),
+                    )
+                    .changed();
+                opacity_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.prefs.config.opacity_dim, 0.1..=1.0)
+                            .text("透明模式不透明度"),
+                    )
+                    .on_hover_text("只在桌宠鼠标穿透时使用；实际不透明度不超过常规值。")
+                    .changed();
+                ui.add_space(12.0);
+                ui.heading("高亮描边");
+                let condition_label = |condition| match condition {
+                    OutlineCondition::Never => "关闭",
+                    OutlineCondition::Dragging => "拖拽时",
+                    OutlineCondition::Pressing => "鼠标按下时",
+                    OutlineCondition::Focused => "窗口获得焦点时",
+                    OutlineCondition::Always => "始终",
+                };
+                let outline = &mut self.prefs.config.rendering.outline;
+                for (label, condition) in [
+                    ("开启条件", &mut outline.condition),
+                    ("开启条件（操控中）", &mut outline.controlled_condition),
+                ] {
+                    egui::ComboBox::from_label(label).selected_text(condition_label(*condition)).show_ui(ui, |ui| {
+                        for value in [OutlineCondition::Never, OutlineCondition::Dragging, OutlineCondition::Pressing, OutlineCondition::Focused, OutlineCondition::Always] {
+                            opacity_changed |= ui.selectable_value(condition, value, condition_label(value)).changed();
+                        }
+                    });
+                }
+                ui.small("操控中指手动动作模式；窗口焦点不等于鼠标悬停。");
+                ui.horizontal(|ui| {
+                    opacity_changed |= ui.color_edit_button_srgba_unmultiplied(&mut outline.color).changed();
+                    ui.label("描边颜色");
+                    opacity_changed |= ui.color_edit_button_srgba_unmultiplied(&mut outline.controlled_color).changed();
+                    ui.label("描边颜色（操控中）");
+                });
+                opacity_changed |= ui.add(egui::Slider::new(&mut outline.width, 1.0..=5.0).step_by(0.5)
+                    .text("描边宽度").suffix(" 逻辑像素")).changed();
+                ui.add_space(12.0);
+                ui.heading("光照效果");
+                opacity_changed |= ui.add(egui::Slider::new(&mut self.prefs.config.rendering.shadow_opacity, 0.0..=1.0)
+                    .text("阴影强度")).on_hover_text("角色轮廓周围的黑色阴影；0 为关闭，不是地面投影。").changed();
+                ui.horizontal(|ui| {
+                    for (label, value) in [("禁用", 0.0), ("轻微", 119.0/255.0), ("标准", 187.0/255.0), ("重墨", 1.0)] {
+                        opacity_changed |= ui.selectable_value(&mut self.prefs.config.rendering.shadow_opacity, value, label).changed();
+                    }
+                });
+                opacity_changed |= ui.checkbox(&mut self.prefs.config.rendering.high_quality, "高质量滤波（描边与阴影）")
+                    .on_hover_text("开启使用高斯邻域滤波，关闭使用圆周采样；只影响描边与阴影。").changed();
+                opacity_changed |= ui.checkbox(&mut self.prefs.config.rendering.mipmaps, "MipMap 抗锯齿")
+                    .on_hover_text("保留原图并生成缩小采样层，减少缩放时的锯齿和闪烁；关闭后使用基础层线性采样。").changed();
+                ui.add_space(12.0);
+                ui.heading("窗口边界");
+                let canvas = &mut self.prefs.config.rendering.canvas;
+                let coverage_label = |value: f32| match value {
+                    0.45 => "最宽", 0.65 => "较宽", 0.8 => "标准", 0.9 => "较窄", 0.95 => "最窄", _ => "自定义",
+                };
+                egui::ComboBox::from_label("边界大小").selected_text(coverage_label(canvas.coverage)).show_ui(ui, |ui| {
+                    for value in [0.45, 0.65, 0.8, 0.9, 0.95] { ui.selectable_value(&mut canvas.coverage, value, coverage_label(value)); }
+                }).response.on_hover_text("根据所有动画采样的累计不透明度裁剪；阈值越高，边界通常越窄。");
+                let sampling_label = |value| match value { 1 => "极精确", 4 => "精确", 16 => "粗略", 64 => "极粗略", _ => "自定义" };
+                egui::ComboBox::from_label("边界计算方式").selected_text(sampling_label(canvas.sampling_interval)).show_ui(ui, |ui| {
+                    for value in [1, 4, 16, 64] { ui.selectable_value(&mut canvas.sampling_interval, value, sampling_label(value)); }
+                }).response.on_hover_text("以 30 FPS 为基准，分别每 1、4、16、64 帧抽样一次；只在载入或重新计算时执行。");
+                ui.small("修改后重新计算；不会重置当前动画或暂停状态。");
+                if ui.add_enabled(self.renderer.is_some(), egui::Button::new("重新计算边界")).clicked() {
+                    if let Some(renderer) = &mut self.renderer {
+                        match renderer.recalculate_bounds(*canvas) {
+                            Ok(()) => {
+                                self.error = None;
+                                if let Some(motion) = &mut self.desktop_motion { motion.next_work_area_update = Instant::now(); }
+                                opacity_changed = true;
+                            }
+                            Err(error) => self.error = Some(format!("计算窗口边界失败: {error}")),
+                        }
+                    }
+                }
+                if let Some(renderer) = &self.renderer {
+                    if renderer.canvas_settings != *canvas { ui.label("边界设置待应用"); }
+                    ui.small(format!("已采样 {} 个姿态", renderer.canvas_samples));
+                    if renderer.effective_canvas_coverage < renderer.canvas_settings.coverage {
+                        ui.small(format!("模型内容较淡，实际裁剪阈值为 {:.1}%", renderer.effective_canvas_coverage * 100.0));
+                    }
+                }
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.heading("过渡");
+                let preset_label = |preset| match preset {
+                    TransitionPreset::Disabled => "禁用（0 秒）",
+                    TransitionPreset::Fast => "快速（0.1 秒）",
+                    TransitionPreset::Standard => "标准（0.3 秒）",
+                    TransitionPreset::Slow => "慢速（0.6 秒）",
+                };
+                for (label, duration, help) in [
+                    ("动画交叉过渡", &mut self.prefs.config.animation_mix_duration,
+                        "控制不同骨骼动作间的混合；0 为立即切换，下次切换起生效。"),
+                    ("常规属性过渡", &mut self.prefs.config.property_transition_duration,
+                        "控制位置、朝向翻转、不透明度和描边强度；0 为立即切换。拖拽位置直接跟手，暂停时属性过渡仍会完成。"),
+                ] {
+                    let selected = TransitionPreset::from_seconds(*duration)
+                        .map(|preset| preset_label(preset).to_owned())
+                        .unwrap_or_else(|| format!("{duration} 秒（自定义）"));
+                    egui::ComboBox::from_label(label).selected_text(selected).show_ui(ui, |ui| {
+                        for preset in TransitionPreset::ALL {
+                            opacity_changed |= ui.selectable_value(duration, preset.seconds(), preset_label(preset)).changed();
+                        }
+                    }).response.on_hover_text(help);
+                }
+                let curve_label = |curve| match curve {
+                    EasingFunction::Linear => "线性",
+                    EasingFunction::EaseOutSine => "正弦缓出",
+                    EasingFunction::EaseOutCubic => "三次缓出",
+                    EasingFunction::EaseOutQuint => "五次缓出",
+                };
+                egui::ComboBox::from_label("缓动函数")
+                    .selected_text(curve_label(self.prefs.config.easing))
+                    .show_ui(ui, |ui| {
+                        for curve in [
+                            EasingFunction::Linear,
+                            EasingFunction::EaseOutSine,
+                            EasingFunction::EaseOutCubic,
+                            EasingFunction::EaseOutQuint,
+                        ] {
+                            opacity_changed |= ui
+                                .selectable_value(
+                                    &mut self.prefs.config.easing,
+                                    curve,
+                                    curve_label(curve),
+                                )
+                                .changed();
+                        }
+                    });
+                if opacity_changed {
+                    ui.ctx().request_repaint_of(desktop_id());
+                }
                 ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(12.0);
                 ui.heading("桌面窗口");
+                if ui
+                    .checkbox(&mut self.prefs.click_through, "透明模式（鼠标穿透）")
+                    .changed()
+                {
+                    ui.ctx().request_repaint_of(desktop_id());
+                }
                 let taskbar_changed = ui
                     .add_enabled(
                         shell_visibility::SUPPORTED,
@@ -1011,8 +1245,14 @@ impl App {
                     .clicked()
                 {
                     self.prefs.config = PetConfig::default();
+                    if let Some(renderer) = &mut self.renderer {
+                        if let Err(error) = renderer.recalculate_bounds(self.prefs.config.rendering.canvas) {
+                            self.error = Some(format!("恢复默认边界失败: {error}"));
+                        }
+                    }
                     self.prefs.fps = 60;
                     let defaults = Preferences::default();
+                    self.prefs.click_through = defaults.click_through;
                     self.prefs.show_in_taskbar = defaults.show_in_taskbar;
                     self.prefs.auto_taskbar_height = defaults.auto_taskbar_height;
                     self.prefs.taskbar_height = defaults.taskbar_height;
@@ -1079,7 +1319,11 @@ impl App {
                     match result {
                         Ok(catalog) if !catalog.models.is_empty() => {
                             let root = path.parent().unwrap_or(Path::new(".")).to_owned();
-                            match Renderer::load(ctx, &catalog.models[0], &root) {
+                            match Renderer::load(
+                                &catalog.models[0],
+                                &root,
+                                self.prefs.config.rendering.canvas,
+                            ) {
                                 Ok(renderer) => {
                                     let model = catalog.models[0].clone();
                                     self.catalog = catalog;
@@ -1105,6 +1349,9 @@ impl App {
                 ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::Visible(false));
             }
             self.desktop_motion = None;
+            self.desktop_opacity = None;
+            self.desktop_presentation = transition::Presentation::default();
+            self.desktop_effects = effects::EffectState::default();
             #[cfg(target_os = "macos")]
             return self.desktop_viewport_builder(None);
             #[cfg(not(target_os = "macos"))]
@@ -1112,7 +1359,7 @@ impl App {
         }
         let renderer = self.renderer.as_ref()?;
         let size = renderer.size(180.0 * self.prefs.config.display_scale);
-        let window_size = size + Vec2::new(40.0, 20.0);
+        let window_size = size + Vec2::splat(2.0 * effects::padding(&self.prefs.config));
         #[cfg(target_os = "macos")]
         let opening = self.desktop_motion.is_none();
         if self.desktop_motion.is_none() {
@@ -1154,13 +1401,17 @@ impl App {
             ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::Visible(true));
             ctx.request_repaint_of(desktop_id());
         }
-        self.desktop_viewport_builder(Some(motion.screen_position()))
+        self.desktop_viewport_builder(Some(
+            motion
+                .last_window_position
+                .unwrap_or(motion.screen_position()),
+        ))
     }
 
     fn desktop_viewport_builder(&self, position: Option<Pos2>) -> Option<egui::ViewportBuilder> {
         let renderer = self.renderer.as_ref()?;
-        let window_size =
-            renderer.size(180.0 * self.prefs.config.display_scale) + Vec2::new(40.0, 20.0);
+        let window_size = renderer.size(180.0 * self.prefs.config.display_scale)
+            + Vec2::splat(2.0 * effects::padding(&self.prefs.config));
         let builder = egui::ViewportBuilder::default()
             .with_title("ArkPets - 桌宠")
             .with_visible(false)
@@ -1230,19 +1481,31 @@ impl App {
         };
         self.advance(&ctx, dt);
         let paused = self.paused();
+        let (opacity, opacity_animating) = self
+            .desktop_opacity
+            .get_or_insert_with(|| {
+                opacity::OpacityFade::new(&self.prefs.config, self.prefs.click_through, started)
+            })
+            .update(&self.prefs.config, self.prefs.click_through, started);
         let bottom_height = self.prefs.bottom_height();
         let motion = self.desktop_motion.as_mut().unwrap();
+        if self.prefs.click_through {
+            motion.body.end_drag();
+            motion.gesture = DirectionGesture::default();
+        }
         let (Some(runtime), Some(renderer)) = (&mut self.runtime, &self.renderer) else {
             return;
         };
         let character = runtime.character_mut();
         let size = renderer.size(180.0 * self.prefs.config.display_scale);
-        let window_size = size + Vec2::new(40.0, 20.0);
+        let padding = effects::padding(&self.prefs.config);
+        let window_size = size + Vec2::splat(2.0 * padding);
         let pixels_per_point = ctx.pixels_per_point();
         if started >= motion.next_work_area_update
             || motion.pixels_per_point != pixels_per_point
             || motion.size != window_size
         {
+            let old_scale = motion.pixels_per_point;
             motion.next_work_area_update = started + Duration::from_secs(1);
             if let Err(error) = desktop::movement_areas(
                 &ctx,
@@ -1260,8 +1523,24 @@ impl App {
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
                 return;
             }
+            let factor = old_scale / pixels_per_point;
+            self.desktop_presentation.rescale_position(factor);
+            if let Some(previous) = motion.last_window_position {
+                let previous = previous * factor;
+                motion.last_window_position = Some(previous);
+                let constrained = motion.constrain_display_position(previous, window_size);
+                if constrained.distance(previous) > 0.001 {
+                    self.desktop_presentation
+                        .reset_position(constrained, started);
+                }
+            } else {
+                self.desktop_presentation
+                    .reset_position(motion.screen_position(), started);
+            }
         }
         let mut interacted = false;
+        let mut properties_animating = false;
+        let was_dragging = motion.body.dragging;
         #[cfg(debug_assertions)]
         if let Some(capture) = &mut self.capture {
             capture.desktop(&ctx, self.frame_ms);
@@ -1279,21 +1558,26 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
             .show(root_ui, |ui| {
-                let target = Rect::from_min_size(Pos2::new(20.0, 20.0), size);
+                let target = Rect::from_min_size(Pos2::new(padding, padding), size);
                 let response =
                     ui.interact(target, ui.id().with("desktop-pet"), Sense::click_and_drag());
-                if response.clicked() {
+                if response.clicked() && !self.prefs.click_through {
                     interacted |= character.click();
                 }
-                if response.drag_started() && self.prefs.config.allow_interact {
+                if response.drag_started()
+                    && self.prefs.config.allow_drag
+                    && !self.prefs.click_through
+                {
                     let fallback = response
                         .interact_pointer_pos()
                         .map(|p| window_origin + p.to_vec2());
                     match desktop::cursor_position(pixels_per_point, ctx.zoom_factor(), fallback) {
                         Ok(Some(cursor)) => {
-                            motion.start_drag(cursor, window_size);
-                            character.play_animation("Relax");
-                            interacted = true;
+                            motion.start_drag_from_window(cursor, window_origin, window_size);
+                            if self.prefs.config.allow_interact {
+                                character.play_animation("Relax");
+                                interacted = true;
+                            }
                         }
                         Err(error) => {
                             self.error = Some(format!("读取鼠标位置失败: {error}"));
@@ -1302,7 +1586,7 @@ impl App {
                         Ok(None) => {}
                     }
                 }
-                if motion.body.dragging || response.hovered() {
+                if motion.body.dragging || (response.hovered() && !self.prefs.click_through) {
                     let fallback = ctx
                         .input(|input| input.pointer.latest_pos())
                         .map(|p| window_origin + p.to_vec2());
@@ -1316,7 +1600,7 @@ impl App {
                                 character.set_direction(direction);
                             }
                             if motion.body.dragging {
-                                if !self.prefs.config.allow_interact {
+                                if !self.prefs.config.allow_drag {
                                     motion.body.end_drag();
                                 } else if let Some(cursor) = cursor {
                                     motion.drag_to(
@@ -1346,12 +1630,26 @@ impl App {
                         character.set_direction(direction);
                     }
                 }
-                renderer.paint(
-                    ui.painter(),
-                    target,
+                let (facing, turning) = self.desktop_presentation.facing(
                     character.animation().direction,
-                    self.prefs.config.opacity_normal,
+                    &self.prefs.config,
+                    started,
                 );
+                properties_animating |= turning;
+                let (effect, outline_animating) = self.desktop_effects.update(
+                    &self.prefs.config,
+                    effects::Input {
+                        dragging: motion.body.dragging,
+                        pressing: response.is_pointer_button_down_on(),
+                        focused: ctx.input(|input| input.viewport().focused.unwrap_or(false)),
+                        controlled: !self.prefs.automatic,
+                    },
+                    opacity,
+                    pixels_per_point,
+                    started,
+                );
+                properties_animating |= outline_animating;
+                renderer.paint_with_facing(ui.painter(), target, facing, effect, &self.compositor);
                 response.context_menu(|ui| {
                     if ui.button("关闭桌宠").clicked() {
                         self.desktop_open = false;
@@ -1373,7 +1671,42 @@ impl App {
         }
         // Avoid generating an OS move/redraw event for an unchanged pixel.
         let scale = ctx.pixels_per_point();
-        let position = (motion.screen_position() * scale).round() / scale;
+        let snap_position = motion.body.dragging
+            || was_dragging
+            || self.prefs.config.property_transition_duration == 0.0;
+        let (visual_target, reset) = match motion.display_target(window_size, snap_position) {
+            Ok(target) => target,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                self.desktop_open = false;
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                return;
+            }
+        };
+        if reset {
+            if let Some(previous) = motion.last_window_position {
+                self.desktop_presentation.reset_position(previous, started);
+            }
+        }
+        let (visual_position, moving) = self.desktop_presentation.position(
+            visual_target,
+            snap_position,
+            &self.prefs.config,
+            started,
+        );
+        properties_animating |= moving;
+        let position =
+            match motion.display_position(visual_position, window_size, scale, snap_position) {
+                Ok(position) => position,
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    self.desktop_open = false;
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    return;
+                }
+            };
+        properties_animating |= motion.last_window_position != Some(position)
+            && position.distance(motion.screen_position()) > 1.0 / scale;
         let first_frame = motion.last_window_position.is_none();
         if motion.last_window_position != Some(position) {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
@@ -1384,7 +1717,7 @@ impl App {
             // backends. Keep the HWND hidden until its pixels and frame are ready.
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
-        if !paused {
+        if !paused || opacity_animating || properties_animating {
             request_next_frame(&ctx, &mut self.next_frame, self.prefs.fps, started);
         }
         request_repaint_at(&ctx, motion.next_work_area_update);
@@ -1512,7 +1845,7 @@ impl App {
         }
         // A visible preview must keep painting even when the desktop callback
         // owns Spine updates. Hidden and paused previews need no animation timer.
-        if !self.paused() && self.preview_visible(&ctx) {
+        if (!self.paused() || self.preview_properties_animating) && self.preview_visible(&ctx) {
             request_next_frame(&ctx, &mut self.preview_next_frame, self.prefs.fps, now);
         }
         if self.desktop_open && ctx.input(|input| !input.events.is_empty()) {
@@ -1567,6 +1900,7 @@ impl eframe::App for NativeApp {
 
     #[cfg(windows)]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.state.lock().unwrap().compositor.destroy_gl();
         eprintln!("ArkPets exit callback");
     }
 
@@ -1849,6 +2183,7 @@ mod tests {
             prefs: Preferences::default(),
             runtime: None,
             renderer: None,
+            compositor: renderer::Compositor::Recording,
             selected: 0,
             search: String::new(),
             favorites: Vec::new(),
@@ -1859,6 +2194,12 @@ mod tests {
             import_path: String::new(),
             desktop_open: false,
             desktop_motion: None,
+            desktop_opacity: None,
+            desktop_presentation: transition::Presentation::default(),
+            preview_presentation: transition::Presentation::default(),
+            preview_properties_animating: false,
+            preview_effects: effects::EffectState::default(),
+            desktop_effects: effects::EffectState::default(),
             last_frame: Instant::now(),
             next_frame: Instant::now(),
             preview_next_frame: Instant::now(),
@@ -2043,14 +2384,20 @@ mod tests {
 
     #[test]
     fn desktop_preferences_load_old_configs_and_round_trip_custom_values() {
-        let mut prefs: Preferences =
-            serde_json::from_str(r#"{"fps":30,"selected":"pepe"}"#).unwrap();
+        let mut prefs: Preferences = serde_json::from_str(
+            r#"{"fps":30,"selected":"pepe","config":{"transitionDuration":0.6}}"#,
+        )
+        .unwrap();
         assert_eq!(prefs.fps, 30);
         assert!(!prefs.show_in_taskbar);
         assert_eq!(prefs.auto_taskbar_height, cfg!(windows));
         assert!(prefs.multi_monitors);
         assert_eq!(prefs.initial_position, [0.2, 0.2]);
         assert_eq!(prefs.config.activity_level, 4);
+        assert_eq!(prefs.config.animation_mix_duration, 0.6);
+        assert_eq!(prefs.config.property_transition_duration, 0.3);
+        assert_eq!(prefs.config.easing, EasingFunction::EaseOutCubic);
+        assert!(!prefs.click_through);
         assert_eq!(
             prefs.config.direction_switching,
             DirectionSwitching::DragRelease
@@ -2062,9 +2409,18 @@ mod tests {
         prefs.show_in_taskbar = true;
         prefs.auto_taskbar_height = false;
         prefs.taskbar_height = 120;
+        prefs.click_through = true;
+        prefs.config.opacity_dim = 0.25;
+        prefs.config.property_transition_duration = 0.1;
+        prefs.config.easing = EasingFunction::EaseOutSine;
         let restored: Preferences =
             serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         assert!(restored.show_in_taskbar);
+        assert!(restored.click_through);
+        assert_eq!(restored.config.opacity_dim, 0.25);
+        assert_eq!(restored.config.property_transition_duration, 0.1);
+        assert_eq!(restored.config.easing, EasingFunction::EaseOutSine);
+        assert_eq!(restored.config.animation_mix_duration, 0.6);
         assert_eq!(restored.bottom_height(), Some(120));
         assert!(!restored.multi_monitors);
         assert_eq!(restored.initial_position, [0.8, 0.1]);
@@ -2073,6 +2429,77 @@ mod tests {
             restored.config.direction_switching,
             DirectionSwitching::Hover
         );
+    }
+
+    #[test]
+    fn preferences_round_trip_through_actual_eframe_ron_storage() {
+        #[derive(Default)]
+        struct Storage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for Storage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.into(), value);
+            }
+            fn remove_string(&mut self, key: &str) {
+                self.0.remove(key);
+            }
+            fn flush(&mut self) {}
+        }
+        let mut storage = Storage::default();
+        storage.0.insert("preferences".into(), r#"(config:(allowInteract:false,physics:(gravity:1200.0,drag:0.95,maxVelocity:(x:450.0,y:600.0),minVelocity:7.0,bounceDamping:0.2),transitionDuration:0.6,opacityTransitionDuration:0.1,opacityTransition:EASE_OUT_SINE),fps:30)"#.into());
+        let mut prefs: Preferences = eframe::get_value(&storage, "preferences")
+            .expect("old RON preferences remain readable");
+        assert!(!prefs.config.allow_interact);
+        assert!(prefs.config.allow_drag);
+        assert_eq!(prefs.config.animation_mix_duration, 0.6);
+        assert_eq!(prefs.config.property_transition_duration, 0.1);
+        assert_eq!(prefs.config.easing, EasingFunction::EaseOutSine);
+        assert_eq!(prefs.config.physics.gravity, 1200.0);
+        assert_eq!(prefs.config.physics.drag, 0.95);
+        assert_eq!(prefs.config.physics.air_friction, 0.0);
+        assert_eq!(prefs.config.physics.ground_friction, 0.0);
+        assert_eq!(
+            prefs.config.physics.max_velocity,
+            PetVec2::new(450.0, 600.0)
+        );
+        eframe::set_value(&mut storage, "preferences", &prefs);
+        let restored: Preferences = eframe::get_value(&storage, "preferences").unwrap();
+        assert_eq!(restored.config.physics, prefs.config.physics);
+        prefs.config.allow_drag = false;
+        prefs.config.physics.air_friction = 150.0;
+        prefs.config.physics.ground_friction = 700.0;
+        prefs.config.physics.drag = 1.0;
+        prefs.config.physics.min_velocity = 0.0;
+        prefs.config.animation_mix_duration = 0.137;
+        prefs.config.property_transition_duration = 0.423;
+        prefs.config.easing = EasingFunction::EaseOutQuint;
+        prefs.config.rendering.outline.condition = OutlineCondition::Pressing;
+        prefs.config.rendering.outline.controlled_condition = OutlineCondition::Never;
+        prefs.config.rendering.outline.color = [12, 34, 56, 78];
+        prefs.config.rendering.outline.width = 3.5;
+        prefs.config.rendering.shadow_opacity = 0.25;
+        prefs.config.rendering.high_quality = false;
+        prefs.config.rendering.mipmaps = false;
+        prefs.config.rendering.canvas = arkpets::config::CanvasSettings {
+            coverage: 0.65,
+            sampling_interval: 16,
+        };
+        eframe::set_value(&mut storage, "preferences", &prefs);
+        let restored: Preferences = eframe::get_value(&storage, "preferences").unwrap();
+        assert_eq!(restored.config.physics, prefs.config.physics);
+        assert!(!restored.config.allow_drag);
+        assert_eq!(restored.config.animation_mix_duration, 0.137);
+        assert_eq!(restored.config.property_transition_duration, 0.423);
+        assert_eq!(restored.config.easing, EasingFunction::EaseOutQuint);
+        assert_eq!(restored.config.rendering, prefs.config.rendering);
+        let saved = &storage.0["preferences"];
+        assert!(
+            saved.contains("animationMixDuration:")
+                && saved.contains("propertyTransitionDuration:")
+        );
+        assert!(!saved.contains("opacityTransitionDuration:"));
     }
 
     #[test]
@@ -2208,6 +2635,118 @@ mod tests {
     }
 
     #[test]
+    fn transparent_mode_fades_real_meshes_while_paused_then_stops_repainting() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.desktop_open = true;
+        app.set_paused(true);
+        app.prefs.config.opacity_dim = 0.25;
+        app.prefs.config.property_transition_duration = 1.0;
+        app.runtime
+            .as_mut()
+            .unwrap()
+            .apply(PetCommand::Configure(app.prefs.config.clone()))
+            .unwrap();
+        app.desktop_builder(&ctx).unwrap();
+        let motion = app.desktop_motion.as_mut().unwrap();
+        motion.taskbar_visibility = Some(app.prefs.show_in_taskbar);
+        #[cfg(windows)]
+        {
+            motion.appearance_ready = true;
+        }
+        let size = app.renderer.as_ref().unwrap().size(180.0)
+            + Vec2::splat(2.0 * effects::padding(&app.prefs.config));
+        motion.size = size;
+        motion.last_window_position = Some(motion.screen_position());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        motion.next_work_area_update = deadline;
+        let position = motion.body.position;
+        let spine = &app.renderer.as_ref().unwrap().spine as *const _;
+        let alphas = |output: &egui::FullOutput| -> Vec<u8> {
+            output
+                .shapes
+                .iter()
+                .flat_map(|shape| match &shape.shape {
+                    egui::Shape::Callback(callback) => callback
+                        .callback
+                        .downcast_ref::<renderer::RecordedGroup>()
+                        .map(|group| {
+                            group
+                                .meshes
+                                .iter()
+                                .flat_map(|mesh| mesh.vertices.iter().map(|v| v.color.a()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                })
+                .collect()
+        };
+        let output = ctx.run_ui(Default::default(), |ui| app.desktop_frame(ui));
+        let normal = alphas(&output);
+        assert!(normal.iter().any(|&a| a > 0));
+        output.drop_without_applying_deltas();
+
+        app.prefs.click_through = true;
+        assert_eq!(
+            app.desktop_builder(&ctx).unwrap().mouse_passthrough,
+            Some(true)
+        );
+        for _ in 0..5 {
+            let output = ctx.run_ui(Default::default(), |ui| app.desktop_frame(ui));
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                    < Duration::from_secs(1)
+            );
+            output.drop_without_applying_deltas();
+        }
+        app.prefs.config.property_transition_duration = 0.0;
+        app.runtime
+            .as_mut()
+            .unwrap()
+            .apply(PetCommand::Configure(app.prefs.config.clone()))
+            .unwrap();
+        for pass in 0..5 {
+            let output = ctx.run_ui(Default::default(), |ui| app.desktop_frame(ui));
+            let dim = alphas(&output);
+            assert_eq!(normal.len(), dim.len());
+            assert_eq!(
+                normal, dim,
+                "slot alpha must not be reduced before compositing"
+            );
+            let group = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Callback(callback) => {
+                        callback.callback.downcast_ref::<renderer::RecordedGroup>()
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(group.opacity, 0.25);
+            if pass == 4 {
+                assert!(
+                    Instant::now() + output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                        >= deadline
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert!(app.paused());
+        assert_eq!(app.desktop_motion.as_ref().unwrap().body.position, position);
+        assert_eq!(&app.renderer.as_ref().unwrap().spine as *const _, spine);
+        app.prefs.click_through = false;
+        assert_eq!(
+            app.desktop_builder(&ctx).unwrap().mouse_passthrough,
+            Some(false)
+        );
+        let output = ctx.run_ui(Default::default(), |ui| app.desktop_frame(ui));
+        assert_eq!(alphas(&output), normal);
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
     fn commands_survive_model_switches_and_update_the_render_configuration() {
         let ctx = egui::Context::default();
         let mut app = test_app(&ctx);
@@ -2223,6 +2762,15 @@ mod tests {
             ..Default::default()
         };
         sender.try_send(PetCommand::Configure(config)).unwrap();
+        sender
+            .try_send(PetCommand::ConfigureTransitions(
+                arkpets::TransitionUpdate {
+                    animation_mix_duration: Some(0.137),
+                    property_transition_duration: Some(0.423),
+                    easing: Some(EasingFunction::Linear),
+                },
+            ))
+            .unwrap();
         sender.try_send(PetCommand::SetAutomatic(false)).unwrap();
         sender
             .try_send(PetCommand::PlayAnimation("Move".into()))
@@ -2236,6 +2784,9 @@ mod tests {
         assert!(!app.paused());
         assert_eq!(app.animation_name, "Move");
         assert_eq!(app.prefs.config.display_scale, 1.4);
+        assert_eq!(app.prefs.config.animation_mix_duration, 0.137);
+        assert_eq!(app.prefs.config.property_transition_duration, 0.423);
+        assert_eq!(app.prefs.config.easing, EasingFunction::Linear);
         assert_eq!(
             app.runtime
                 .as_ref()
@@ -2304,7 +2855,16 @@ mod tests {
                         app.preview(ui, 1.0 / 60.0);
                     });
                     for shape in &output.shapes {
-                        if let egui::Shape::Mesh(mesh) = &shape.shape {
+                        let meshes: Vec<_> = match &shape.shape {
+                            egui::Shape::Mesh(mesh) => vec![mesh.as_ref()],
+                            egui::Shape::Callback(callback) => callback
+                                .callback
+                                .downcast_ref::<renderer::RecordedGroup>()
+                                .map(|group| group.meshes.iter().collect())
+                                .unwrap_or_default(),
+                            _ => Vec::new(),
+                        };
+                        for mesh in meshes {
                             assert!(
                                 mesh.vertices.iter().all(|v| v.pos.is_finite()),
                                 "non-finite mesh at {size:?}"

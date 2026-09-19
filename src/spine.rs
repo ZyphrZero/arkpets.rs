@@ -43,8 +43,20 @@ unsafe extern "C" {
     fn ark_spine_free(pet: *mut c_void);
     fn ark_spine_animation_count(pet: *mut c_void) -> c_int;
     fn ark_spine_animation_name(pet: *mut c_void, index: c_int) -> *const c_char;
+    fn ark_spine_animation_duration(
+        pet: *const c_void,
+        name: *const c_char,
+        duration: *mut f32,
+    ) -> c_int;
+    fn ark_spine_sample_animation(pet: *mut c_void, name: *const c_char, time: f32) -> c_int;
     fn ark_spine_page(pet: *mut c_void, index: c_int) -> *const c_char;
     fn ark_spine_play(pet: *mut c_void, name: *const c_char, looping: c_int) -> c_int;
+    fn ark_spine_play_with_mix(
+        pet: *mut c_void,
+        name: *const c_char,
+        looping: c_int,
+        mix: f32,
+    ) -> c_int;
     fn ark_spine_update(pet: *mut c_void, delta: f32, mix: f32) -> c_int;
     fn ark_spine_meshes(pet: *mut c_void, context: *mut c_void, emit: MeshCallback);
 }
@@ -84,7 +96,7 @@ pub struct Spine {
 // never changes global allocator callbacks or Bone.yDown, calls disposeStatics,
 // or uses the random vertex effects. play/update/meshes/drop only mutate the
 // exclusively owned graph and use the default thread-safe C allocator. NonNull
-// keeps Spine !Sync; every runtime operation requires &mut self or ownership.
+// keeps Spine !Sync; every mutating runtime operation requires &mut self or ownership.
 unsafe impl Send for Spine {}
 
 impl Spine {
@@ -201,6 +213,69 @@ impl Spine {
         Ok(())
     }
 
+    /// Returns the animation's duration in seconds without changing its state.
+    pub fn animation_duration(&self, name: &str) -> Result<f32, SpineError> {
+        let c_name =
+            CString::new(name).map_err(|_| SpineError::Invalid("animation contains NUL".into()))?;
+        let mut duration = 0.0;
+        if unsafe {
+            ark_spine_animation_duration(self.raw.as_ptr(), c_name.as_ptr(), &mut duration)
+        } == 0
+        {
+            return Err(SpineError::Invalid(format!("animation not found: {name}")));
+        }
+        if !duration.is_finite() || duration < 0.0 {
+            return Err(SpineError::Invalid(format!(
+                "invalid animation duration for {name}: {duration}"
+            )));
+        }
+        Ok(duration)
+    }
+
+    /// Replaces the skeleton pose with an unblended sample for load-time analysis.
+    ///
+    /// Each sample starts from the setup pose. AnimationState clocks, tracks,
+    /// crossfades, and completion events stay unchanged; this is not a playback
+    /// seek. After analysis, sample the initial animation at zero to restore its
+    /// starting pose before regular playback. Invalid requests preserve the pose.
+    pub fn sample_animation(&mut self, name: &str, time: f32) -> Result<(), SpineError> {
+        if !time.is_finite() || time < 0.0 {
+            return Err(SpineError::Invalid(
+                "animation sample time must be finite and non-negative".into(),
+            ));
+        }
+        let c_name =
+            CString::new(name).map_err(|_| SpineError::Invalid("animation contains NUL".into()))?;
+        match unsafe { ark_spine_sample_animation(self.raw.as_ptr(), c_name.as_ptr(), time) } {
+            1 => Ok(()),
+            0 => Err(SpineError::Invalid(format!("animation not found: {name}"))),
+            _ => Err(SpineError::Invalid(format!(
+                "animation sample time {time} is outside the valid duration for {name}"
+            ))),
+        }
+    }
+
+    /// Starts an animation using this duration for its incoming crossfade.
+    ///
+    /// Spine captures the duration when creating the track entry, so changing
+    /// the default during a later update cannot configure this transition.
+    pub fn play_with_mix(&mut self, name: &str, looping: bool, mix: f32) -> Result<(), SpineError> {
+        if !mix.is_finite() || !(0.0..=2.0).contains(&mix) {
+            return Err(SpineError::Invalid(
+                "animation mix must be finite and between 0 and 2 seconds".into(),
+            ));
+        }
+        let c_name =
+            CString::new(name).map_err(|_| SpineError::Invalid("animation contains NUL".into()))?;
+        if unsafe {
+            ark_spine_play_with_mix(self.raw.as_ptr(), c_name.as_ptr(), looping.into(), mix)
+        } == 0
+        {
+            return Err(SpineError::Invalid(format!("animation not found: {name}")));
+        }
+        Ok(())
+    }
+
     pub fn update(&mut self, delta: f32, mix: f32) -> bool {
         unsafe {
             ark_spine_update(
@@ -305,6 +380,225 @@ mod tests {
             &root.join(format!("build_char_{id}.atlas")),
         )
         .unwrap()
+    }
+
+    fn relaxed_model(id: &str, mix: f32) -> Spine {
+        let mut spine = load_model(id);
+        spine.play("Relax", true).unwrap();
+        for _ in 0..6 {
+            spine.update(0.1, mix);
+        }
+        spine
+    }
+
+    fn positions(spine: &mut Spine) -> Vec<[f32; 2]> {
+        let mut meshes = Vec::new();
+        spine.meshes(&mut meshes);
+        meshes.into_iter().flat_map(|mesh| mesh.positions).collect()
+    }
+
+    fn other_animation(spine: &Spine) -> String {
+        spine
+            .animations
+            .iter()
+            .find(|name| name.as_str() == "Move")
+            .or_else(|| {
+                spine
+                    .animations
+                    .iter()
+                    .find(|name| name.as_str() != "Relax")
+            })
+            .expect("real model must have an animation other than Relax")
+            .clone()
+    }
+
+    #[test]
+    fn real_animation_samples_are_repeatable_and_independent_of_previous_poses() {
+        for id in ["4058_pepe", "1038_whitw2", "4093_frston"] {
+            let mut spine = relaxed_model(id, 0.3);
+            let before_duration = positions(&mut spine);
+            let duration = spine.animation_duration("Relax").unwrap();
+            assert!(duration.is_finite() && duration > 0.0, "{id}");
+            assert_eq!(positions(&mut spine), before_duration);
+            let time = duration * 0.25;
+            spine.sample_animation("Relax", time).unwrap();
+            let expected = positions(&mut spine);
+            assert!(expected.len() > 20);
+            for name in spine.animations.clone() {
+                let other_duration = spine.animation_duration(&name).unwrap();
+                spine.sample_animation(&name, other_duration).unwrap();
+                spine.sample_animation("Relax", time).unwrap();
+                assert_eq!(
+                    positions(&mut spine),
+                    expected,
+                    "{id}: previous {name} sample changed the Relax pose"
+                );
+            }
+            spine.sample_animation("Relax", 0.0).unwrap();
+            assert_ne!(positions(&mut spine), expected, "{id}: sample did not move");
+        }
+    }
+
+    #[test]
+    fn invalid_animation_samples_preserve_real_model_pose() {
+        for id in ["4058_pepe", "1038_whitw2", "4093_frston"] {
+            let mut spine = relaxed_model(id, 0.3);
+            let duration = spine.animation_duration("Relax").unwrap();
+            let before = positions(&mut spine);
+            for (name, time) in [
+                ("Relax", f32::NAN),
+                ("Relax", f32::INFINITY),
+                ("Relax", f32::NEG_INFINITY),
+                ("Relax", -0.01),
+                ("Relax", duration + 0.01),
+                ("missing-animation", 0.0),
+                ("invalid\0animation", 0.0),
+            ] {
+                assert!(spine.sample_animation(name, time).is_err());
+                assert_eq!(positions(&mut spine), before, "{id}: {name} at {time}");
+            }
+            for name in ["missing-animation", "invalid\0animation"] {
+                assert!(spine.animation_duration(name).is_err());
+                assert_eq!(positions(&mut spine), before);
+            }
+        }
+    }
+
+    #[test]
+    fn sampling_preserves_real_model_playback_clock_and_completion() {
+        for id in ["4058_pepe", "1038_whitw2", "4093_frston"] {
+            let assert_pose_matches = |spine: &mut Spine, reference: &mut Spine| {
+                let actual = positions(spine);
+                let expected = positions(reference);
+                assert_eq!(actual.len(), expected.len(), "{id}");
+                // Playback's FIRST blend computes old + (target - old), unlike
+                // a SETUP sample. Resetting the old pose changes f32 rounding.
+                for (index, (a, b)) in actual
+                    .iter()
+                    .flatten()
+                    .zip(expected.iter().flatten())
+                    .enumerate()
+                {
+                    assert!((a - b).abs() < 0.001, "{id}: component {index}: {a} != {b}");
+                }
+            };
+            let mut spine = load_model(id);
+            let mut reference = load_model(id);
+            spine.play("Relax", false).unwrap();
+            reference.play("Relax", false).unwrap();
+            for _ in 0..2 {
+                spine.update(0.1, 0.3);
+                reference.update(0.1, 0.3);
+            }
+            let next = other_animation(&spine);
+            spine
+                .sample_animation(&next, spine.animation_duration(&next).unwrap())
+                .unwrap();
+            spine.sample_animation("Relax", 0.0).unwrap();
+            spine.update(0.0, 0.3);
+            reference.update(0.0, 0.3);
+            assert_pose_matches(&mut spine, &mut reference);
+            let before = positions(&mut spine);
+            let steps = (spine.animation_duration("Relax").unwrap() / 0.1).ceil() as usize;
+            let mut completed = false;
+            for _ in 0..=steps {
+                let actual_completed = spine.update(0.1, 0.3);
+                assert_eq!(actual_completed, reference.update(0.1, 0.3), "{id}");
+                completed |= actual_completed;
+                assert_pose_matches(&mut spine, &mut reference);
+            }
+            assert!(completed, "{id}: completion event was lost");
+            assert_ne!(positions(&mut spine), before, "{id}: playback stopped");
+        }
+    }
+
+    #[test]
+    fn first_transition_uses_its_requested_mix_for_real_models() {
+        for id in ["4058_pepe", "1038_whitw2", "4093_frston"] {
+            let mut immediate_positions = None;
+            for mix in [0.0, 0.6, 2.0] {
+                let mut spine = relaxed_model(id, 0.3);
+                // The legacy path has the requested default before switching;
+                // play_with_mix must match it without a preceding update.
+                let mut reference = relaxed_model(id, mix);
+                let next = other_animation(&spine);
+                assert_eq!(positions(&mut spine), positions(&mut reference));
+                spine.play_with_mix(&next, true, mix).unwrap();
+                reference.play(&next, true).unwrap();
+                for delta in [0.0, 0.05] {
+                    // A later default change must not alter an existing fade.
+                    spine.update(delta, 0.3);
+                    reference.update(delta, 0.3);
+                    let actual = positions(&mut spine);
+                    assert!(actual.len() > 20, "{id} produced no geometry");
+                    assert_eq!(
+                        actual,
+                        positions(&mut reference),
+                        "{id}: incorrect first transition at mix={mix}, delta={delta}"
+                    );
+                    if delta > 0.0 {
+                        if mix == 0.0 {
+                            immediate_positions = Some(actual);
+                        } else {
+                            assert_ne!(
+                                Some(actual),
+                                immediate_positions,
+                                "{id}: crossfade must differ from an immediate change"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_transition_preserves_real_model_playback_and_default_mix() {
+        for id in ["4058_pepe", "1038_whitw2", "4093_frston"] {
+            for (name, mix) in [
+                (None, f32::NAN),
+                (None, f32::INFINITY),
+                (None, f32::NEG_INFINITY),
+                (None, -0.01),
+                (None, 2.01),
+                (Some("missing-animation"), 1.5),
+                (Some("invalid\0animation"), 1.5),
+            ] {
+                let mut spine = relaxed_model(id, 0.3);
+                let mut reference = relaxed_model(id, 0.3);
+                let next = other_animation(&spine);
+                assert!(spine
+                    .play_with_mix(name.unwrap_or(&next), true, mix)
+                    .is_err());
+                assert_eq!(positions(&mut spine), positions(&mut reference));
+                // No update between rejection and play: this also detects an
+                // invalid request that changed only the default mix duration.
+                spine.play(&next, true).unwrap();
+                reference.play(&next, true).unwrap();
+                for delta in [0.0, 0.05] {
+                    spine.update(delta, 0.3);
+                    reference.update(delta, 0.3);
+                    assert_eq!(
+                        positions(&mut spine),
+                        positions(&mut reference),
+                        "{id}: rejected transition changed playback for {name:?}, mix={mix}"
+                    );
+                }
+
+                let mut spine = relaxed_model(id, 0.3);
+                let mut reference = relaxed_model(id, 0.3);
+                assert!(spine
+                    .play_with_mix(name.unwrap_or(&next), true, mix)
+                    .is_err());
+                spine.update(0.05, 0.3);
+                reference.update(0.05, 0.3);
+                assert_eq!(
+                    positions(&mut spine),
+                    positions(&mut reference),
+                    "{id}: rejected transition must keep playing Relax"
+                );
+            }
+        }
     }
 
     #[test]

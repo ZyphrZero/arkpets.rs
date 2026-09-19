@@ -24,7 +24,7 @@ impl DirectionGesture {
         hovered: bool,
         config: &PetConfig,
     ) -> Option<Direction> {
-        if !config.allow_interact || (!self.dragging && !hovered) {
+        if (self.dragging && !config.allow_drag) || (!self.dragging && !hovered) {
             *self = Self::default();
             return None;
         }
@@ -58,7 +58,7 @@ impl DirectionGesture {
 
     pub fn release(&mut self, config: &PetConfig) -> Option<Direction> {
         let direction = (self.dragging
-            && config.allow_interact
+            && config.allow_drag
             && config.direction_switching != DirectionSwitching::Disabled)
             .then_some(self.last_direction)
             .flatten();
@@ -105,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn jitter_hover_reentry_and_disabled_interaction_do_not_flip() {
+    fn jitter_hover_reentry_and_disabled_drag_do_not_flip() {
         let mut config = PetConfig {
             direction_switching: DirectionSwitching::Hover,
             ..Default::default()
@@ -116,9 +116,25 @@ mod tests {
         }
         gesture.update(None, false, &config);
         assert_eq!(gesture.update(Some(100.0), true, &config), None);
-        config.allow_interact = false;
+        config.allow_drag = false;
         gesture.start_drag(100.0);
         assert_eq!(gesture.update(Some(-100.0), true, &config), None);
         assert_eq!(gesture.release(&config), None);
+    }
+
+    #[test]
+    fn disabling_interaction_animation_does_not_disable_direction_gestures() {
+        let config = PetConfig {
+            allow_interact: false,
+            direction_switching: DirectionSwitching::Drag,
+            ..Default::default()
+        };
+        let mut gesture = DirectionGesture::default();
+        gesture.start_drag(100.0);
+        assert_eq!(
+            gesture.update(Some(80.0), true, &config),
+            Some(Direction::Left)
+        );
+        assert_eq!(gesture.release(&config), Some(Direction::Left));
     }
 }

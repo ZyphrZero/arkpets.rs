@@ -5,8 +5,9 @@
 ## 项目定位与参考
 
 - 本项目是 Ark-Pets 的 Rust 原生桌面实现，包含与 UI 无关的行为核心、命令行工具和透明桌宠窗口。
-- 原项目：`E:\GitHub\Ark-Pets`，用于查阅 Java 桌面行为与平台集成。修改参考仓库需要属于用户明确要求的任务范围；本仓库不依赖这一绝对路径构建或运行。
-- 先阅读 [README.md](README.md) 了解使用方式，按任务阅读 [架构说明](docs/ARCHITECTURE.md) 和 [迁移记录](docs/MIGRATION.md)。依赖与 feature 以 `Cargo.toml` 为准，CI 命令以 `.github/workflows/ci.yml` 为准，文档与实现不一致时先核对当前代码。
+- 原项目：`/Users/用户名/Documents/GitHub/Ark-Pets`，用于查阅 Java 桌面行为与平台集成。修改参考仓库需要属于用户明确要求的任务范围；本仓库不依赖这一绝对路径构建或运行。
+- 先阅读 [README.md](README.md) 了解使用方式，按任务阅读 [架构说明](docs/ARCHITECTURE.md)、[迁移记录](docs/MIGRATION.md) 和 [配置迁移计划](docs/MIGRATION_PLAN.md)。依赖与 feature 以 `Cargo.toml` 为准，CI 命令以 `.github/workflows/ci.yml` 为准，文档与实现不一致时先核对当前代码。
+- 当前优先完善桌宠自身的原版功能、配置语义和平台验证。Agent 联动是让桌宠响应外部任务状态的可选扩展，普通桌宠与四档过渡设置均独立运行；不要把外部通信当作配置迁移的前置条件。仅在任务涉及实际联动时设计或实现协议。
 - 当前尚未完整替代原项目。macOS 已有菜单栏入口；Windows/Linux 系统托盘、开机启动、多宠 IPC、联网模型管理、Agent CLI 传输协议、消息气泡和养成系统等不能当作已有能力。
 
 ## 代码入口与职责
@@ -19,9 +20,11 @@
 | `src/model.rs`、`src/config.rs` | 模型清单、资源路径、角色配置 |
 | `src/animation.rs`、`src/physics.rs`、`src/character.rs` | 动作选择、物理、拖拽和角色状态 |
 | `src/interaction.rs` | 与窗口无关的交互翻转模式和指针手势状态 |
-| `src/runtime.rs` | `PetRuntime`、类型化命令、有界队列、暂停和命令执行结果 |
+| `src/runtime.rs` | `PetRuntime`、类型化命令、有界队列、局部过渡配置更新、暂停和命令执行结果 |
 | `src/spine.rs`、`src/spine_bridge.c`、`build.rs` | Spine 3.8 C 运行时的构建、FFI 所有权、动画与裁剪网格输出 |
-| `src/ui/renderer.rs`、`src/ui/backend.rs` | 图集与网格绘制；后端选择、校验和 bootstrap 配置 |
+| `src/ui/renderer.rs`、`src/ui/renderer/` | 图集与网格、wgpu／Glow 整角色合成、描边阴影、MipMap 和 CPU 动画边界分析 |
+| `src/ui/transition.rs`、`src/ui/opacity.rs`、`src/ui/effects.rs` | 常规属性过渡、透明模式及描边条件；独立于暂停的骨骼／物理时钟 |
+| `src/ui/backend.rs` | 后端选择、校验和 bootstrap 配置 |
 | `src/ui/desktop.rs`、`src/ui/desktop/regions.rs`、`src/ui/platform.rs` | 多屏部署与物理、屏幕并集边界；Windows 原生窗口集成 |
 | `src/ui/shell_visibility.rs`、`src/ui/shell_visibility/` | 平台外壳可见性入口，以及 Linux X11、macOS 实现 |
 | `src/ui/menu_bar.rs` | macOS 原生菜单栏入口、菜单动作和资源生命周期 |
@@ -30,11 +33,15 @@
 
 ## 实现约束
 
-- 保持核心库与 egui、窗口系统和外部通信协议解耦。新增外部集成应在适配层解析输入，再提交 `PetCommand`；保留队列容量、每帧处理预算、参数校验和失败反馈。入队成功不等于命令执行成功。
+- 保持核心库与 egui、窗口系统和外部通信协议解耦。新增外部集成应在适配层解析输入，再提交 `PetCommand`；保留队列容量、每帧处理预算、参数校验和失败反馈。当前命令是进程内 Rust API，不能描述为已可连接外部 Agent。入队成功、命令执行成功和视觉过渡完成是不同状态，`PetEvent` 只报告命令执行结果。
+- 两项过渡的 UI 保留原版四档：禁用／快速／标准／慢速对应 0／0.1／0.3／0.6 秒，默认标准，共用 `TransitionPreset`。配置仍保存秒数，自定义值必须原样显示和保存，不能吸附到最近档位。`ConfigureTransitions(TransitionUpdate)` 按执行时配置保留未指定字段；全量和局部命令共用校验，失败整条拒绝，不能覆盖无关配置或重置运行状态。
+- 骨骼混合与常规属性过渡独立：混合时长在 Spine 创建新动画 track entry 前应用；位置、朝向、不透明度和描边强度使用常规过渡，暂停时仍可完成，完成后停止额外高频重绘。拖拽直接跟手，以实际显示位置建立锚点；多屏过渡遵守屏幕并集，DPI 变化保留物理位置和过渡进度。
+- 交互动画与拖拽开关独立。物理保留旧 `drag`／`min_velocity` 配置的兼容行为；当前最大速度为 0 表示停止该轴惯性，与 Java 的不限速不同。普通／操控中描边的“操控中”表示手动动作模式；边界和 MipMap 的原版差异见配置迁移计划，不能声明完全等价。
 - 启动器与桌宠共享一份角色运行时、Spine 实例和图集纹理。桌宠打开时由桌宠回调推进动画，主界面可见时预览按设定帧率持续绘制同一份模型状态；预览不能依赖鼠标输入才播放。主界面隐藏、最小化或不显示预览时停止预览动画刷新；避免双窗口重复推进骨骼、无条件定时重绘和持有 egui Context 的引用环。
 - 区分预览坐标、桌面坐标、逻辑点与物理像素。修改拖拽、工作区或底部高度时，保留 DPI 换算、边界裁剪和释放速度限制；覆盖零尺寸、极小窗口及非有限数值边界。
 - 保留原图集分辨率和系统 DPI。网格批处理只合并相邻兼容批次，保持 slot 顺序、索引与混合语义；不通过纹理排序改变遮挡关系。
 - 正常渲染使用原生透明窗口与 GPU 合成，不引入逐帧 GPU 读回、CPU 像素拷贝或 GDI 合成。截图读回仅用于显式诊断。
+- 全局不透明度在完整角色与效果合成后统一应用，不得乘进各 Spine slot 造成肢体重叠处变深。wgpu 与 Glow 保持预乘 Alpha 和效果顺序一致。窗口边界分析使用独立临时 Spine，不改动正在播放的姿态；分析分辨率不能用于降低实际图集或窗口分辨率，重新计算不能改变角色缩放基准。
 - Windows 支持 DX12 与 OpenGL，默认 DX12；macOS 使用 Metal，Linux 使用 Vulkan。后端优先级为 `--renderer`、`ARKPETS_RENDERER`、`bootstrap.json`、平台默认值。无效配置或不支持的后端必须报错，不能静默换用其他后端。
 - 修改后端切换时保留同进程切换、角色与暂停状态，以及纹理重新绑定。修改 DX12 呈现时核对 DirectComposition、窗口创建标志和 Mailbox 设置，验证双窗口重绘下的内存与帧节奏。
 - 外壳可见性通过平台模块处理。Windows 窗口样式、Linux X11/EWMH 和 macOS 应用激活策略具有不同作用范围；不能假定原生 Wayland 支持 X11 路径，也不能把 macOS 应用级 Dock 设置描述为独立窗口开关。macOS 默认只显示菜单栏，Dock 偏好独立于桌宠开关；主界面按钮与菜单请求必须共用隐藏视口的唤醒流程。
@@ -99,6 +106,17 @@ pwsh -NoProfile -File docs/scripts/Verify-Interaction.ps1 -Renderer dx12 -Behavi
 ```
 
 后端切换和桌面交互变更也应按影响范围使用 `-Renderer opengl` 复测。透明验证必须检查系统合成后能看到受控背景，仅有 GPU 截图 Alpha 通道不足以证明原生窗口透明。
+
+macOS 按修改范围顺序运行原生回归，使用真实模型和隔离偏好；需要登录图形桌面并保持屏幕亮起，期间不要操作测试窗口：
+
+```sh
+cargo run --locked --example verify-macos-preview
+cargo run --locked --example verify-macos-opacity
+cargo run --locked --example verify-macos-behavior
+cargo run --locked --example verify-macos-effects
+```
+
+上述检查覆盖预览调度、整角色透明度、属性过渡和渲染效果；菜单栏、Dock、生命周期和拖拽回归入口见 README。命令入口改动还须检查四档映射、自定义值、局部更新、失败不修改状态，以及实际 RON 持久化。原生 GPU 截图和命令回归不能替代其他平台或系统透明合成验证。
 
 性能改动使用 release 构建与 `docs/scripts/Measure-Performance.ps1`；固定机器、渲染器、模型、缩放、目标帧率和窗口场景。`frames.json` 记录回调间隔，`memory.json` 记录进程内存，不能据此声称屏幕实际 FPS 或显存占用。采样命令和压力测试参数见 README。
 

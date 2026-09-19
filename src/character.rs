@@ -90,8 +90,12 @@ impl CharacterState {
             || self.config.allow_walk != config.allow_walk
             || self.config.allow_special != config.allow_special
             || self.config.activity_level != config.activity_level
+            || self.config.allow_interact != config.allow_interact
         {
             self.animation.configure(&config);
+        }
+        if !config.allow_drag {
+            self.physics.end_drag();
         }
         self.config = config;
     }
@@ -155,11 +159,13 @@ impl CharacterState {
     }
 
     pub fn start_drag(&mut self, cursor: Vec2) {
-        if !self.config.allow_interact {
+        if !self.config.allow_drag {
             return;
         }
         self.physics.start_drag(cursor);
-        let _ = self.animation.play("Relax");
+        if self.config.allow_interact {
+            let _ = self.animation.play("Relax");
+        }
     }
 
     pub fn drag_to(&mut self, cursor: Vec2, dt: f32, bounds: Bounds) {
@@ -272,6 +278,30 @@ mod tests {
         character.end_drag();
         assert_eq!(character.position(), Vec2::new(90.0, 90.0));
         assert_eq!(character.physics().velocity, Vec2::new(900.0, 900.0));
+    }
+
+    #[test]
+    fn interaction_animation_and_dragging_are_independent() {
+        let mut config = PetConfig {
+            allow_interact: false,
+            ..Default::default()
+        };
+        let mut character = CharacterState::new(model(), config.clone(), Vec2::new(20.0, 20.0), 1);
+        assert!(character.play_animation("Move"));
+        assert!(!character.click());
+        character.start_drag(Vec2::ZERO);
+        assert!(character.physics().dragging);
+        assert_eq!(character.animation().animation, "Move");
+        character.drag_to(Vec2::new(30.0, 20.0), 0.1, Bounds::new(200.0, 200.0));
+        assert_eq!(character.position(), Vec2::new(30.0, 20.0));
+        config.allow_drag = false;
+        config.allow_interact = true;
+        character.configure(config);
+        assert!(!character.physics().dragging);
+        character.start_drag(Vec2::ZERO);
+        assert!(!character.physics().dragging);
+        assert!(character.click());
+        assert_eq!(character.animation().animation, "Interact");
     }
 
     #[test]

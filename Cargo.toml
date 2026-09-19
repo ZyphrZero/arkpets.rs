@@ -42,6 +42,21 @@ name = "verify-macos-preview"
 path = "docs/scripts/verify_macos_preview.rs"
 required-features = ["ui"]
 
+[[example]]
+name = "verify-macos-opacity"
+path = "docs/scripts/verify_macos_opacity.rs"
+required-features = ["ui"]
+
+[[example]]
+name = "verify-macos-behavior"
+path = "docs/scripts/verify_macos_behavior.rs"
+required-features = ["ui"]
+
+[[example]]
+name = "verify-macos-effects"
+path = "docs/scripts/verify_macos_effects.rs"
+required-features = ["ui"]
+
 [dependencies]
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

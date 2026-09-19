@@ -95,6 +95,7 @@ impl AnimationMachine {
                 "Sleep" => config.allow_sleep,
                 "Move" => config.allow_walk,
                 "Special" => config.allow_special,
+                "Interact" => config.allow_interact,
                 _ => true,
             })
             .cloned()
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn disabled_actions_never_appear_in_automatic_transitions() {
         let mut machine = AnimationMachine::with_seed(
-            ["Relax", "Move", "Sit", "Sleep", "Special"]
+            ["Relax", "Move", "Sit", "Sleep", "Special", "Interact"]
                 .into_iter()
                 .map(str::to_owned),
             7,
@@ -291,6 +292,7 @@ mod tests {
             allow_sit: false,
             allow_sleep: false,
             allow_special: false,
+            allow_interact: false,
             ..Default::default()
         });
         for _ in 0..500 {

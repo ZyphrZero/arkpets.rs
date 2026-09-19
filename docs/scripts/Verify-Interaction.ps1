@@ -373,7 +373,7 @@ try {
         }
         Click-Client $root 270 ($height - 334)
         foreach ($heightPx in @(120, 0, 80)) {
-            Click-Client $root 395 ($height - 300)
+            Click-Client $root 395 ($height - 299)
             [ArkPetsInteraction]::Key(0x11, $true)
             try {
                 [ArkPetsInteraction]::Key(0x41, $true)
@@ -406,8 +406,8 @@ try {
         Set-Number $root 400 299 200 # Walk speed.
         Set-Number $root 395 341 16 # Activity level.
         Click-Client $root 300 383
-        Click-Client $root 300 547 # Hover, including drag and release.
-        Set-Number $root 395 493 0 # Keep deployment stationary for native coordinate assertions.
+        Click-Client $root 300 548 # Hover, including drag and release.
+        Set-Number $root 395 500 0 # Keep deployment stationary for native coordinate assertions.
         Move-Pointer $point.X $point.Y
         Assert-PointerTarget $root
         [ArkPetsInteraction]::Wheel(-12000)

@@ -34,9 +34,12 @@ impl Bounds {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", from = "PhysicsConfigInput")]
 pub struct PhysicsConfig {
     pub gravity: f32,
+    pub air_friction: f32,
+    pub ground_friction: f32,
+    /// Legacy per-frame damping, retained for previously saved configurations.
     pub drag: f32,
     pub max_velocity: Vec2,
     pub min_velocity: f32,
@@ -45,14 +48,74 @@ pub struct PhysicsConfig {
 
 impl Default for PhysicsConfig {
     fn default() -> Self {
-        // These values match the web implementation. The desktop defaults are
-        // close enough for the same simulation and can be configured per app.
         Self {
-            gravity: 1000.0,
-            drag: 0.98,
+            gravity: 800.0,
+            air_friction: 100.0,
+            ground_friction: 500.0,
+            drag: 1.0,
             max_velocity: Vec2::new(1000.0, 1000.0),
-            min_velocity: 5.0,
+            min_velocity: 0.0,
             bounce_damping: 0.7,
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct PhysicsConfigInput {
+    #[serde(deserialize_with = "deserialize_present")]
+    gravity: Option<f32>,
+    #[serde(deserialize_with = "deserialize_present")]
+    air_friction: Option<f32>,
+    #[serde(deserialize_with = "deserialize_present")]
+    ground_friction: Option<f32>,
+    #[serde(deserialize_with = "deserialize_present")]
+    drag: Option<f32>,
+    #[serde(deserialize_with = "deserialize_present")]
+    max_velocity: Option<Vec2>,
+    #[serde(deserialize_with = "deserialize_present")]
+    min_velocity: Option<f32>,
+    #[serde(deserialize_with = "deserialize_present")]
+    bounce_damping: Option<f32>,
+}
+
+// Option tracks field presence internally; the persisted fields are bare values
+// in JSON and RON, rather than RON's explicit Some(...) representation.
+fn deserialize_present<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+impl From<PhysicsConfigInput> for PhysicsConfig {
+    fn from(input: PhysicsConfigInput) -> Self {
+        // Old preferences used exponential damping instead of acceleration.
+        // Preserve that behavior until a user opts into the new friction values.
+        let defaults = if input.drag.is_some()
+            && input.air_friction.is_none()
+            && input.ground_friction.is_none()
+        {
+            Self {
+                gravity: 1000.0,
+                air_friction: 0.0,
+                ground_friction: 0.0,
+                drag: 0.98,
+                min_velocity: 5.0,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        };
+        Self {
+            gravity: input.gravity.unwrap_or(defaults.gravity),
+            air_friction: input.air_friction.unwrap_or(defaults.air_friction),
+            ground_friction: input.ground_friction.unwrap_or(defaults.ground_friction),
+            drag: input.drag.unwrap_or(defaults.drag),
+            max_velocity: input.max_velocity.unwrap_or(defaults.max_velocity),
+            min_velocity: input.min_velocity.unwrap_or(defaults.min_velocity),
+            bounce_damping: input.bounce_damping.unwrap_or(defaults.bounce_damping),
         }
     }
 }
@@ -122,6 +185,21 @@ impl PhysicsState {
         config: PhysicsConfig,
         walking: Option<(crate::Direction, f32)>,
     ) {
+        let grounded = self.position.y >= bounds.max_position(size).y - 0.001;
+        self.step_with_ground_contact(dt, bounds, size, config, walking, grounded);
+    }
+
+    /// Advances physics using a caller-provided ground contact, for surfaces
+    /// such as a monitor's floor within a larger desktop bounding rectangle.
+    pub fn step_with_ground_contact(
+        &mut self,
+        dt: f32,
+        bounds: Bounds,
+        size: Vec2,
+        config: PhysicsConfig,
+        walking: Option<(crate::Direction, f32)>,
+        grounded: bool,
+    ) {
         if !dt.is_finite() || dt <= 0.0 {
             return;
         }
@@ -129,7 +207,13 @@ impl PhysicsState {
         let max = bounds.max_position(size);
 
         if !self.dragging {
+            let grounded = grounded && self.velocity.y >= 0.0;
             self.velocity.y += config.gravity * dt;
+            if grounded {
+                self.velocity.x = apply_friction(self.velocity.x, config.ground_friction * dt);
+            }
+            self.velocity.x = apply_friction(self.velocity.x, config.air_friction * dt);
+            self.velocity.y = apply_friction(self.velocity.y, config.air_friction * dt);
             let damping = config.drag.powf(dt * 60.0);
             self.velocity.x *= damping;
             self.velocity.y *= damping;
@@ -179,6 +263,10 @@ impl PhysicsState {
         }
         self.position = clamp_position(self.position, max);
     }
+}
+
+fn apply_friction(velocity: f32, amount: f32) -> f32 {
+    velocity.signum() * (velocity.abs() - amount).max(0.0)
 }
 
 fn clamp_position(position: Vec2, max: Vec2) -> Vec2 {
@@ -258,6 +346,239 @@ mod tests {
             state.end_drag();
             assert_eq!(state.position, Vec2::new(30.0, 30.0));
             assert_eq!(state.velocity, Vec2::ZERO);
+        }
+    }
+
+    fn friction_config(air_friction: f32, ground_friction: f32) -> PhysicsConfig {
+        PhysicsConfig {
+            gravity: 0.0,
+            air_friction,
+            ground_friction,
+            ..PhysicsConfig::default()
+        }
+    }
+
+    fn airborne_state(velocity: Vec2) -> PhysicsState {
+        PhysicsState {
+            position: Vec2::new(1000.0, 1000.0),
+            velocity,
+            ..PhysicsState::default()
+        }
+    }
+
+    #[test]
+    fn air_friction_slows_both_axes_without_ground_friction() {
+        let mut state = airborne_state(Vec2::new(100.0, -100.0));
+        state.step(
+            0.1,
+            Bounds::new(10_000.0, 10_000.0),
+            Vec2::ZERO,
+            friction_config(100.0, 500.0),
+            None,
+        );
+        assert_eq!(state.velocity, Vec2::new(90.0, -90.0));
+    }
+
+    #[test]
+    fn gravity_is_applied_before_air_friction() {
+        let mut state = airborne_state(Vec2::ZERO);
+        state.step(
+            0.1,
+            Bounds::new(10_000.0, 10_000.0),
+            Vec2::ZERO,
+            PhysicsConfig::default(),
+            None,
+        );
+        assert_eq!(state.velocity.y, 70.0);
+    }
+
+    #[test]
+    fn ground_friction_adds_to_air_friction_only_on_horizontal_axis() {
+        let mut state = airborne_state(Vec2::new(100.0, 100.0));
+        state.step_with_ground_contact(
+            0.1,
+            Bounds::new(10_000.0, 10_000.0),
+            Vec2::ZERO,
+            friction_config(100.0, 500.0),
+            None,
+            true,
+        );
+        assert_eq!(state.velocity, Vec2::new(40.0, 90.0));
+
+        state.position.y = 10_000.0;
+        state.velocity = Vec2::new(-100.0, 0.0);
+        state.step(
+            0.1,
+            Bounds::new(10_000.0, 10_000.0),
+            Vec2::ZERO,
+            friction_config(100.0, 500.0),
+            None,
+        );
+        assert_eq!(state.velocity, Vec2::new(-40.0, 0.0));
+    }
+
+    #[test]
+    fn upward_throw_does_not_receive_ground_friction() {
+        let mut state = airborne_state(Vec2::new(100.0, -100.0));
+        state.position.y = 10_000.0;
+        state.step(
+            0.1,
+            Bounds::new(10_000.0, 10_000.0),
+            Vec2::ZERO,
+            PhysicsConfig::default(),
+            None,
+        );
+        assert_eq!(state.velocity, Vec2::new(90.0, -10.0));
+        assert!(state.position.y < 10_000.0);
+    }
+
+    #[test]
+    fn friction_stops_small_velocities_without_reversing_them() {
+        for velocity in [-10.0, -5.0, 0.0, 5.0, 10.0] {
+            let mut state = airborne_state(Vec2::new(velocity, velocity));
+            state.step(
+                0.1,
+                Bounds::new(10_000.0, 10_000.0),
+                Vec2::ZERO,
+                friction_config(100.0, 500.0),
+                None,
+            );
+            assert_eq!(state.velocity, Vec2::ZERO);
+        }
+    }
+
+    #[test]
+    fn zero_friction_preserves_velocity() {
+        let mut state = airborne_state(Vec2::new(-100.0, 100.0));
+        state.step_with_ground_contact(
+            0.1,
+            Bounds::new(10_000.0, 10_000.0),
+            Vec2::ZERO,
+            friction_config(0.0, 0.0),
+            None,
+            true,
+        );
+        assert_eq!(state.velocity, Vec2::new(-100.0, 100.0));
+    }
+
+    #[test]
+    fn friction_acceleration_has_consistent_velocity_across_frame_rates() {
+        for fps in [30, 60, 120] {
+            let mut airborne = airborne_state(Vec2::new(800.0, 100.0));
+            let mut grounded = airborne_state(Vec2::new(800.0, 0.0));
+            grounded.position.y = 10_000.0;
+            for _ in 0..fps {
+                for state in [&mut airborne, &mut grounded] {
+                    state.step(
+                        1.0 / fps as f32,
+                        Bounds::new(10_000.0, 10_000.0),
+                        Vec2::ZERO,
+                        PhysicsConfig::default(),
+                        None,
+                    );
+                }
+            }
+            assert!((airborne.velocity.x - 700.0).abs() < 0.01);
+            assert!((airborne.velocity.y - 800.0).abs() < 0.01);
+            assert!((grounded.velocity.x - 200.0).abs() < 0.01);
+            assert_eq!(grounded.velocity.y, 0.0);
+        }
+    }
+
+    #[test]
+    fn simulation_velocity_is_bounded_in_both_directions_and_zero_stops_an_axis() {
+        for sign in [-1.0, 1.0] {
+            for limit in [Vec2::new(250.0, 125.0), Vec2::ZERO] {
+                let mut state = airborne_state(Vec2::new(sign * 1000.0, sign * 1000.0));
+                state.step(
+                    0.1,
+                    Bounds::new(10_000.0, 10_000.0),
+                    Vec2::ZERO,
+                    PhysicsConfig {
+                        max_velocity: limit,
+                        ..friction_config(0.0, 0.0)
+                    },
+                    None,
+                );
+                assert_eq!(state.velocity, Vec2::new(sign * limit.x, sign * limit.y));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_drag_velocity_limit_stops_release_on_that_axis() {
+        let mut state = PhysicsState::default();
+        state.start_drag(Vec2::ZERO);
+        state.drag_to(
+            Vec2::new(100.0, 100.0),
+            0.1,
+            Bounds::new(200.0, 200.0),
+            Vec2::ZERO,
+            Vec2::new(0.0, 250.0),
+        );
+        state.end_drag();
+        assert_eq!(state.velocity, Vec2::new(0.0, 250.0));
+    }
+
+    #[test]
+    fn empty_and_new_physics_configs_use_acceleration_defaults() {
+        let empty: PhysicsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, PhysicsConfig::default());
+        assert_eq!(empty.gravity, 800.0);
+        assert_eq!(empty.air_friction, 100.0);
+        assert_eq!(empty.ground_friction, 500.0);
+        assert_eq!(empty.drag, 1.0);
+        assert_eq!(empty.min_velocity, 0.0);
+
+        let explicit: PhysicsConfig =
+            serde_json::from_str(r#"{"airFriction":0,"drag":1}"#).unwrap();
+        assert_eq!(explicit.air_friction, 0.0);
+        assert_eq!(explicit.ground_friction, 500.0);
+        assert_eq!(explicit.gravity, 800.0);
+        assert_eq!(explicit.min_velocity, 0.0);
+    }
+
+    #[test]
+    fn legacy_physics_configs_retain_original_damping_and_defaults() {
+        let config: PhysicsConfig = serde_json::from_str(r#"{"drag":0.98}"#).unwrap();
+        assert_eq!(config.gravity, 1000.0);
+        assert_eq!(config.air_friction, 0.0);
+        assert_eq!(config.ground_friction, 0.0);
+        assert_eq!(config.drag, 0.98);
+        assert_eq!(config.min_velocity, 5.0);
+
+        let mut state = airborne_state(Vec2::new(100.0, 0.0));
+        state.step(
+            1.0 / 60.0,
+            Bounds::new(10_000.0, 10_000.0),
+            Vec2::ZERO,
+            config,
+            None,
+        );
+        assert!((state.velocity.x - 98.0).abs() < 0.001);
+        assert!((state.velocity.y - 1000.0 / 60.0 * 0.98).abs() < 0.001);
+
+        let explicit: PhysicsConfig =
+            serde_json::from_str(r#"{"gravity":600,"drag":0.9,"minVelocity":3}"#).unwrap();
+        assert_eq!(explicit.gravity, 600.0);
+        assert_eq!(explicit.drag, 0.9);
+        assert_eq!(explicit.min_velocity, 3.0);
+        assert_eq!(explicit.air_friction, 0.0);
+        assert_eq!(explicit.ground_friction, 0.0);
+    }
+
+    #[test]
+    fn serialized_legacy_and_new_configs_round_trip_without_changing_behavior() {
+        let legacy: PhysicsConfig =
+            serde_json::from_str(r#"{"gravity":600,"drag":0.9,"minVelocity":3}"#).unwrap();
+        for config in [legacy, PhysicsConfig::default(), friction_config(0.0, 0.0)] {
+            let serialized = serde_json::to_string(&config).unwrap();
+            assert!(serialized.contains("\"airFriction\":"));
+            assert!(serialized.contains("\"groundFriction\":"));
+            assert_eq!(
+                serde_json::from_str::<PhysicsConfig>(&serialized).unwrap(),
+                config
+            );
         }
     }
 }

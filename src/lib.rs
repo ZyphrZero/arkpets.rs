@@ -17,7 +17,9 @@ pub mod spine;
 
 pub use animation::{AnimationMachine, AnimationState, Direction};
 pub use character::{CharacterSnapshot, CharacterState};
-pub use config::{DirectionSwitching, PetConfig};
+pub use config::{DirectionSwitching, PetConfig, TransitionPreset};
 pub use model::{CharacterModel, ModelCatalog, ModelError};
 pub use physics::{Bounds, PhysicsConfig, PhysicsState, Vec2};
-pub use runtime::{CommandError, CommandSender, PetCommand, PetEvent, PetRuntime, SubmitError};
+pub use runtime::{
+    CommandError, CommandSender, PetCommand, PetEvent, PetRuntime, SubmitError, TransitionUpdate,
+};

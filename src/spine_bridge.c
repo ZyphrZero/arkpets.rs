@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 typedef struct {
     spAtlas *atlas;
@@ -75,6 +76,23 @@ ArkSpine *ark_spine_load(const char *atlas, int atlas_len, const unsigned char *
 
 int ark_spine_animation_count(ArkSpine *pet) { return pet->data->animationsCount; }
 const char *ark_spine_animation_name(ArkSpine *pet, int i) { return pet->data->animations[i]->name; }
+int ark_spine_animation_duration(const ArkSpine *pet, const char *name, float *duration) {
+    spAnimation *animation = spSkeletonData_findAnimation(pet->data, name);
+    if (!animation) return 0;
+    *duration = animation->duration;
+    return 1;
+}
+int ark_spine_sample_animation(ArkSpine *pet, const char *name, float time) {
+    spAnimation *animation = spSkeletonData_findAnimation(pet->data, name);
+    if (!animation) return 0;
+    if (!isfinite(time) || !isfinite(animation->duration) || time < 0 || time > animation->duration) return -1;
+    spSkeleton_setToSetupPose(pet->skeleton);
+    /* Direct application leaves AnimationState tracks and completion events intact. */
+    spAnimation_apply(animation, pet->skeleton, -1, time, 0, NULL, NULL, 1,
+                      SP_MIX_BLEND_SETUP, SP_MIX_DIRECTION_IN);
+    spSkeleton_updateWorldTransform(pet->skeleton);
+    return 1;
+}
 const char *ark_spine_page(ArkSpine *pet, int index) {
     spAtlasPage *page = pet->atlas->pages;
     while (page && index-- > 0) page = page->next;
@@ -83,6 +101,14 @@ const char *ark_spine_page(ArkSpine *pet, int index) {
 int ark_spine_play(ArkSpine *pet, const char *name, int loop) {
     spAnimation *animation = spSkeletonData_findAnimation(pet->data, name);
     if (!animation) return 0;
+    spAnimationState_setAnimation(pet->state, 0, animation, loop);
+    pet->completed = 0;
+    return 1;
+}
+int ark_spine_play_with_mix(ArkSpine *pet, const char *name, int loop, float mix) {
+    spAnimation *animation = spSkeletonData_findAnimation(pet->data, name);
+    if (!animation) return 0;
+    pet->state_data->defaultMix = mix;
     spAnimationState_setAnimation(pet->state, 0, animation, loop);
     pet->completed = 0;
     return 1;

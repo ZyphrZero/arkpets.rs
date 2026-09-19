@@ -38,3 +38,5 @@ test*/
 /ArkPetsConfig.json
 /models_data.json
 /*.log
+
+.DS_Store

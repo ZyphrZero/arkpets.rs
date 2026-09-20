@@ -1,6 +1,8 @@
 mod backend;
 mod desktop;
 mod effects;
+mod forms;
+mod keyboard;
 #[cfg(target_os = "macos")]
 mod menu_bar;
 mod opacity;
@@ -77,6 +79,7 @@ struct Preferences {
     taskbar_height: u32,
     multi_monitors: bool,
     initial_position: [f32; 2],
+    form_preferences: Vec<forms::Preference>,
 }
 
 impl Default for Preferences {
@@ -94,6 +97,7 @@ impl Default for Preferences {
             taskbar_height: 48,
             multi_monitors: true,
             initial_position: [0.2, 0.2],
+            form_preferences: Vec::new(),
         }
     }
 }
@@ -110,6 +114,7 @@ pub struct App {
     prefs: Preferences,
     runtime: Option<PetRuntime>,
     renderer: Option<Renderer>,
+    forms: Option<forms::Forms>,
     compositor: renderer::Compositor,
     selected: usize,
     search: String,
@@ -132,6 +137,7 @@ pub struct App {
     preview_next_frame: Instant,
     preview_direction: Direction,
     preview_gesture: DirectionGesture,
+    keyboard: keyboard::Control,
     animation_name: String,
     first_position: bool,
     frame_ms: f32,
@@ -175,6 +181,7 @@ impl App {
             prefs,
             runtime: None,
             renderer: None,
+            forms: None,
             compositor: renderer::Compositor::new(cc),
             selected: 0,
             search: String::new(),
@@ -200,6 +207,7 @@ impl App {
             preview_next_frame: Instant::now(),
             preview_direction: Direction::Right,
             preview_gesture: DirectionGesture::default(),
+            keyboard: keyboard::Control::default(),
             animation_name: String::new(),
             first_position: true,
             frame_ms: 0.0,
@@ -234,6 +242,18 @@ impl App {
             result.desktop_open = true;
             result.page = usize::from(profile.settings().page == "settings");
         }
+        if let Some(profile) = &result.profile {
+            if let Some(form) = result.forms.as_ref().and_then(|forms| forms.active_form()) {
+                result
+                    .select_form(profile.settings().form_mode.resolve(form))
+                    .expect("configure diagnostic form");
+            }
+        } else if let Some(form) = result.forms.as_ref().and_then(|forms| forms.active_form()) {
+            // Persist an old selected model ID as an explicit form preference.
+            if let Err(error) = result.select_form(form) {
+                result.error = Some(error);
+            }
+        }
         result
     }
 
@@ -242,6 +262,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         backend: RendererBackend,
     ) -> Result<(), String> {
+        self.cancel_keyboard();
         configure_fonts(&cc.egui_ctx);
         self.compositor = renderer::Compositor::new(cc);
         self.theme(&cc.egui_ctx);
@@ -310,29 +331,35 @@ impl App {
     }
 
     fn select(&mut self, index: usize, ctx: &egui::Context) {
-        let model = self.catalog.models[index].clone();
-        match Renderer::load(&model, &self.asset_root, self.prefs.config.rendering.canvas) {
-            Ok(renderer) => self.install_model(index, model, renderer),
+        match forms::Forms::load(
+            &self.catalog,
+            index,
+            &self.asset_root,
+            self.prefs.config.rendering.canvas,
+            &self.prefs.form_preferences,
+        ) {
+            Ok((forms, renderer)) => {
+                let active = forms.active;
+                self.install_model(active, self.catalog.models[active].clone(), renderer);
+                self.forms = Some(forms);
+                self.sync_animation(false);
+            }
             Err(error) => self.error = Some(error),
         }
         ctx.request_repaint();
     }
 
     fn install_model(&mut self, index: usize, mut model: CharacterModel, renderer: Renderer) {
+        self.forms = None;
+        self.keyboard = keyboard::Control::default();
         model.animations = renderer.spine.animations.clone();
-        let mut character = CharacterState::new(
+        let character = CharacterState::new(
             model.clone(),
             self.prefs.config.clone(),
             PetVec2::new(160.0, 220.0),
             42 + index as u64,
         );
-        let initial = model
-            .animations
-            .iter()
-            .find(|s| matches!(s.as_str(), "Relax" | "Idle" | "Stand"))
-            .unwrap_or(&model.animations[0]);
-        character.play_animation(initial.clone());
-        self.animation_name = initial.clone();
+        self.animation_name = character.animation().animation.clone();
         self.prefs.selected = model.id;
         self.selected = index;
         if let Some(runtime) = &mut self.runtime {
@@ -354,20 +381,99 @@ impl App {
     }
 
     fn sync_animation(&mut self, force: bool) {
-        if let (Some(runtime), Some(renderer)) = (&self.runtime, &mut self.renderer) {
-            let character = runtime.character();
-            let name = &character.animation().animation;
-            if force || name != &self.animation_name {
-                match renderer.spine.play_with_mix(
-                    name,
-                    name != "Interact",
-                    self.prefs.config.animation_mix_duration,
-                ) {
-                    Ok(()) => self.animation_name = name.clone(),
-                    Err(error) => self.error = Some(error.to_string()),
-                }
+        let dragging = self
+            .desktop_motion
+            .as_ref()
+            .is_some_and(|motion| motion.body.dragging);
+        if let Some(runtime) = &mut self.runtime {
+            let redirected = !dragging
+                && !runtime.paused()
+                && !runtime.automatic()
+                && self.keyboard.prioritize_walk(runtime.character_mut());
+            let name = runtime.character().animation().animation.clone();
+            if let Err(error) = self.play_animation(&name, force && !redirected) {
+                self.error = Some(format!("播放动作失败: {error}"));
+                self.runtime
+                    .as_mut()
+                    .unwrap()
+                    .apply(PetCommand::SetPaused(true))
+                    .unwrap();
             }
         }
+    }
+
+    fn play_animation(&mut self, name: &str, force: bool) -> Result<(), String> {
+        let Some(renderer) = &mut self.renderer else {
+            return Ok(());
+        };
+        if force || self.animation_name != name {
+            renderer
+                .spine
+                .play_with_mix(
+                    name,
+                    arkpets::animation::animation_loops(name),
+                    self.prefs.config.animation_mix_duration,
+                )
+                .map_err(|error| error.to_string())?;
+            renderer.update(0.0, self.prefs.config.animation_mix_duration)?;
+            self.animation_name = name.to_owned();
+        }
+        Ok(())
+    }
+
+    fn select_form(&mut self, form: arkpets::model::ModelForm) -> Result<(), String> {
+        let forms = self.forms.as_ref().ok_or("当前模型未配置形态")?;
+        let target = forms.index_for(form)?;
+        if target != forms.active {
+            self.cancel_keyboard();
+            let forms = self.forms.as_mut().unwrap();
+            let renderer = self.renderer.as_mut().unwrap();
+            let next = forms.prepare(target, renderer.canvas_settings)?;
+            if let Some(motion) = &mut self.desktop_motion {
+                let previous_display = motion.last_window_position;
+                let layout = next.desktop_layout(
+                    180.0 * self.prefs.config.display_scale,
+                    effects::padding(&self.prefs.config),
+                    motion.pixels_per_point,
+                );
+                let delta = motion
+                    .reframe(layout.body.size())
+                    .map_err(|error| error.to_string())?;
+                self.desktop_presentation.translate_position(delta);
+                if let (Some(previous), Some(shown)) =
+                    (previous_display, motion.last_window_position)
+                {
+                    if (previous + delta).distance(shown) > 0.001 {
+                        self.desktop_presentation
+                            .reset_position(shown, Instant::now());
+                    }
+                }
+            }
+            forms.activate(target, renderer);
+            let mut model = self.catalog.models[target].clone();
+            model.animations = renderer.spine.animations.clone();
+            let character = self.runtime.as_mut().unwrap().character_mut();
+            character.set_model_form(model);
+            self.animation_name = character.animation().animation.clone();
+            self.selected = target;
+            self.prefs.selected = self.catalog.models[target].id.clone();
+        }
+        let model = &self.catalog.models[target];
+        if let (Some(character_id), Some(skin_id)) = (&model.character_id, &model.skin_id) {
+            self.prefs
+                .form_preferences
+                .retain(|value| !value.matches(model));
+            self.prefs.form_preferences.push(forms::Preference {
+                character_id: character_id.clone(),
+                skin_id: skin_id.clone(),
+                mode: match form {
+                    arkpets::model::ModelForm::Base => forms::Mode::Base,
+                    arkpets::model::ModelForm::Battle => forms::Mode::Battle,
+                },
+                preferred: form,
+            });
+        }
+        Ok(())
     }
 
     fn paused(&self) -> bool {
@@ -375,8 +481,58 @@ impl App {
     }
 
     fn set_paused(&mut self, paused: bool) {
+        if paused {
+            self.cancel_keyboard();
+        }
         if let Some(runtime) = &mut self.runtime {
             runtime.apply(PetCommand::SetPaused(paused)).unwrap();
+        }
+    }
+
+    fn cancel_keyboard(&mut self) {
+        if let Some(runtime) = &mut self.runtime {
+            self.keyboard.cancel(runtime.character_mut());
+            self.sync_animation(false);
+        }
+    }
+
+    fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.viewport_id();
+        let viewport_enabled = if viewport == desktop_id() {
+            self.desktop_open && !self.prefs.click_through
+        } else {
+            self.page == 0 && !self.import_open
+        };
+        let dragging = self
+            .desktop_motion
+            .as_ref()
+            .is_some_and(|motion| motion.body.dragging);
+        if let Some(runtime) = &mut self.runtime {
+            let enabled = !runtime.automatic() && !runtime.paused() && !dragging;
+            let before = runtime.character().animation().clone();
+            self.keyboard
+                .update(ctx, runtime.character_mut(), enabled, viewport_enabled);
+            if *runtime.character().animation() != before {
+                self.sync_animation(false);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                if self.desktop_open {
+                    ctx.request_repaint_of(desktop_id());
+                }
+            }
+        }
+        if let (Some(profile), Some(runtime)) = (&self.profile, &self.runtime) {
+            let active = self
+                .forms
+                .as_ref()
+                .map_or(self.selected, |forms| forms.active);
+            profile
+                .record_controls(
+                    runtime,
+                    self.keyboard.walking(),
+                    &self.catalog.models[active].id,
+                    self.forms.as_ref().and_then(|forms| forms.active_form()),
+                )
+                .expect("write control diagnostic");
         }
     }
 
@@ -481,12 +637,23 @@ impl App {
                         .desired_width(202.0),
                 );
                 ui.checkbox(&mut self.favorites_only, "仅收藏");
+                let searched = self.catalog.search(&self.search);
                 let matching: Vec<usize> = self
                     .catalog
-                    .search(&self.search)
-                    .iter()
-                    .filter(|model| !self.favorites_only || self.favorites.contains(&model.id))
-                    .filter_map(|model| self.catalog.models.iter().position(|m| m.id == model.id))
+                    .character_indices()
+                    .into_iter()
+                    .filter(|&index| {
+                        searched
+                            .iter()
+                            .any(|model| model.same_character(&self.catalog.models[index]))
+                    })
+                    .filter(|&index| {
+                        !self.favorites_only
+                            || self.catalog.models.iter().any(|model| {
+                                model.same_character(&self.catalog.models[index])
+                                    && self.favorites.contains(&model.id)
+                            })
+                    })
                     .collect();
                 egui::ScrollArea::vertical()
                     .max_height((ui.available_height() - 100.0).max(120.0))
@@ -496,9 +663,12 @@ impl App {
                         }
                         for index in matching {
                             let model = &self.catalog.models[index];
+                            let selected = model
+                                .same_character(&self.catalog.models[self.selected])
+                                && self.renderer.is_some();
                             let title = format!("{}\n{}", model.name, model.id);
                             let button = egui::Button::new(RichText::new(title).size(14.0).color(
-                                if index == self.selected && self.renderer.is_some() {
+                                if selected {
                                     Color32::WHITE
                                 } else if self.prefs.dark {
                                     Color32::from_gray(225)
@@ -506,7 +676,7 @@ impl App {
                                     INK
                                 },
                             ))
-                            .selected(index == self.selected && self.renderer.is_some());
+                            .selected(selected);
                             if ui.add_sized([202.0, 60.0], button).clicked() {
                                 self.select(index, &ctx);
                                 self.page = 0;
@@ -516,9 +686,13 @@ impl App {
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new(format!("{} 个本地模型", self.catalog.models.len()))
-                            .small()
-                            .color(MUTED),
+                        RichText::new(format!(
+                            "{} 个角色 · {} 套模型",
+                            self.catalog.character_indices().len(),
+                            self.catalog.models.len()
+                        ))
+                        .small()
+                        .color(MUTED),
                     );
                     ui.label(RichText::new("ARKPETS.RS  /  0.1.0").small().color(MUTED));
                     ui.separator();
@@ -587,122 +761,193 @@ impl App {
             return;
         }
         let mut paused = self.paused();
+        let original_forms = self.forms.as_ref().and_then(|forms| forms.active_form());
+        let mut form_options = original_forms;
         egui::Panel::right("inspector")
             .exact_size(250.0)
             .resizable(false)
             .show(root_ui, |ui| {
-                ui.add_space(20.0);
-                let Some(character) = self.runtime.as_mut().map(PetRuntime::character_mut) else {
-                    ui.label("未载入模型");
-                    return;
-                };
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("角色").small().color(MUTED));
-                    let id = character.model().id.clone();
-                    let favorite = self.favorites.contains(&id);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(20.0);
+                    let Some(character) = self.runtime.as_mut().map(PetRuntime::character_mut)
+                    else {
+                        ui.label("未载入模型");
+                        return;
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("角色").small().color(MUTED));
+                        let representative =
+                            &self.catalog.models[self.catalog.representative(self.selected)];
+                        let id = representative.id.clone();
+                        let family_ids: Vec<_> = self
+                            .catalog
+                            .models
+                            .iter()
+                            .filter(|model| model.same_character(representative))
+                            .map(|model| model.id.clone())
+                            .collect();
+                        let favorite = self.favorites.iter().any(|id| family_ids.contains(id));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(
+                                ui,
+                                if favorite {
+                                    icons::STAR_HALF
+                                } else {
+                                    icons::STAR
+                                },
+                                "收藏角色",
+                            )
+                            .clicked()
+                            {
+                                if favorite {
+                                    self.favorites.retain(|value| !family_ids.contains(value));
+                                } else {
+                                    self.favorites.push(id);
+                                }
+                            }
+                        });
+                    });
+                    ui.label(
+                        RichText::new(
+                            &self.catalog.models[self.catalog.representative(self.selected)].name,
+                        )
+                        .size(21.0)
+                        .strong(),
+                    );
+                    ui.label(RichText::new(&character.model().id).small().color(MUTED));
+                    if let (Some(forms), Some(selected)) = (&self.forms, &mut form_options) {
+                        use arkpets::model::ModelForm;
+                        if forms.has(ModelForm::Base) && forms.has(ModelForm::Battle) {
+                            egui::ComboBox::from_label("形态")
+                                .selected_text(forms::label(*selected))
+                                .show_ui(ui, |ui| {
+                                    for form in [ModelForm::Base, ModelForm::Battle] {
+                                        ui.selectable_value(selected, form, forms::label(form));
+                                    }
+                                });
+                        }
+                    }
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("动作").strong());
+                    let mut force = false;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.prefs.automatic, true, "自动");
+                        let was_automatic = self.prefs.automatic;
+                        if ui
+                            .selectable_value(&mut self.prefs.automatic, false, "手动")
+                            .clicked()
+                        {
+                            if was_automatic {
+                                force |= character.play_idle();
+                            }
+                            ctx.memory_mut(|memory| {
+                                memory.request_focus(keyboard::target_id(egui::ViewportId::ROOT))
+                            });
+                        }
+                    });
+                    if !self.prefs.automatic {
+                        ui.small("←/→ 行走 · Ctrl 加速 · ↑/↓ 切换动作");
+                        ui.small("点击预览或桌宠获取控制焦点；松开恢复所选动作。");
+                        if arkpets::animation::movement_animation(character.available_animations())
+                            .is_none()
+                        {
+                            ui.small("没有可用 Move 动画，无法按键行走。");
+                        }
+                        if let Some(resting) = self.keyboard.resting_action() {
+                            ui.small(format!("松开方向键后：{resting}"));
+                        }
+                    }
+                    let mut selected = character.animation().animation.clone();
+                    egui::ComboBox::from_id_salt("animation")
+                        .width(220.0)
+                        .selected_text(&selected)
+                        .show_ui(ui, |ui| {
+                            for animation in character.available_animations() {
+                                ui.selectable_value(&mut selected, animation.clone(), animation);
+                            }
+                        });
+                    if selected != character.animation().animation {
+                        if character.play_animation(selected) {
+                            self.prefs.automatic = false;
+                            force = true;
+                        } else {
+                            self.error = Some("该动作已在行为设置中关闭".into());
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if icon_button(ui, icons::ARROW_LEFT, "朝左").clicked() {
+                            character.set_direction(Direction::Left);
+                        }
+                        if icon_button(ui, icons::HAND_TAP, "互动").clicked() {
+                            force |= character.click();
+                        }
+                        if icon_button(ui, icons::ARROW_RIGHT, "朝右").clicked() {
+                            character.set_direction(Direction::Right);
+                        }
                         if icon_button(
                             ui,
-                            if favorite {
-                                icons::STAR_HALF
-                            } else {
-                                icons::STAR
-                            },
-                            "收藏角色",
+                            if paused { icons::PLAY } else { icons::PAUSE },
+                            "播放 / 暂停",
                         )
                         .clicked()
                         {
-                            if favorite {
-                                self.favorites.retain(|value| value != &id);
-                            } else {
-                                self.favorites.push(id);
-                            }
+                            paused = !paused;
                         }
                     });
-                });
-                ui.label(RichText::new(&character.model().name).size(21.0).strong());
-                ui.label(RichText::new(&character.model().id).small().color(MUTED));
-                ui.add_space(20.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(RichText::new("动作").strong());
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.prefs.automatic, true, "自动");
-                    ui.selectable_value(&mut self.prefs.automatic, false, "手动");
-                });
-                let mut selected = character.animation().animation.clone();
-                egui::ComboBox::from_id_salt("animation")
-                    .width(220.0)
-                    .selected_text(&selected)
-                    .show_ui(ui, |ui| {
-                        for animation in character.available_animations() {
-                            ui.selectable_value(&mut selected, animation.clone(), animation);
-                        }
-                    });
-                let mut force = false;
-                if selected != character.animation().animation {
-                    if character.play_animation(selected) {
-                        self.prefs.automatic = false;
-                        force = true;
-                    } else {
-                        self.error = Some("该动作已在行为设置中关闭".into());
-                    }
-                }
-                ui.horizontal(|ui| {
-                    if icon_button(ui, icons::ARROW_LEFT, "朝左").clicked() {
-                        character.set_direction(Direction::Left);
-                    }
-                    if icon_button(ui, icons::HAND_TAP, "互动").clicked() {
-                        force |= character.click();
-                    }
-                    if icon_button(ui, icons::ARROW_RIGHT, "朝右").clicked() {
-                        character.set_direction(Direction::Right);
-                    }
-                    if icon_button(
-                        ui,
-                        if paused { icons::PLAY } else { icons::PAUSE },
-                        "播放 / 暂停",
-                    )
-                    .clicked()
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.label(RichText::new("显示").strong());
+                    ui.add(
+                        egui::Slider::new(&mut self.prefs.config.display_scale, 0.5..=1.7)
+                            .text("缩放")
+                            .suffix(" x"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.prefs.config.opacity_normal, 0.1..=1.0)
+                            .text("不透明度"),
+                    );
+                    ui.checkbox(&mut self.prefs.always_on_top, "桌宠置顶");
+                    if ui
+                        .checkbox(&mut self.prefs.click_through, "透明模式（鼠标穿透）")
+                        .on_hover_text(
+                            "使用透明模式不透明度，鼠标可操作桌宠后方的窗口；可在主界面关闭。",
+                        )
+                        .changed()
                     {
-                        paused = !paused;
+                        ctx.request_repaint_of(desktop_id());
+                    }
+                    ui.add_space(16.0);
+                    ui.separator();
+                    if let Some(renderer) = &self.renderer {
+                        ui.label(RichText::new("资源").strong());
+                        metadata(ui, "Spine", &renderer.spine.version);
+                        metadata(ui, "动画", &renderer.spine.animations.len().to_string());
+                        metadata(ui, "纹理页", &renderer.spine.pages.len().to_string());
+                        metadata(ui, "三角形", &renderer.triangles.to_string());
+                    }
+                    if force {
+                        ctx.memory_mut(|memory| {
+                            memory.request_focus(keyboard::target_id(egui::ViewportId::ROOT))
+                        });
+                        self.sync_animation(true);
                     }
                 });
-                ui.add_space(16.0);
-                ui.separator();
-                ui.label(RichText::new("显示").strong());
-                ui.add(
-                    egui::Slider::new(&mut self.prefs.config.display_scale, 0.5..=1.7)
-                        .text("缩放")
-                        .suffix(" x"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.prefs.config.opacity_normal, 0.1..=1.0)
-                        .text("不透明度"),
-                );
-                ui.checkbox(&mut self.prefs.always_on_top, "桌宠置顶");
-                if ui
-                    .checkbox(&mut self.prefs.click_through, "透明模式（鼠标穿透）")
-                    .on_hover_text(
-                        "使用透明模式不透明度，鼠标可操作桌宠后方的窗口；可在主界面关闭。",
-                    )
-                    .changed()
-                {
+            });
+        if form_options != original_forms {
+            if let Some(form) = form_options {
+                if let Err(error) = self.select_form(form) {
+                    self.error = Some(error);
+                } else {
+                    self.error = None;
+                }
+                ctx.request_repaint();
+                if self.desktop_open {
                     ctx.request_repaint_of(desktop_id());
                 }
-                ui.add_space(16.0);
-                ui.separator();
-                if let Some(renderer) = &self.renderer {
-                    ui.label(RichText::new("资源").strong());
-                    metadata(ui, "Spine", &renderer.spine.version);
-                    metadata(ui, "动画", &renderer.spine.animations.len().to_string());
-                    metadata(ui, "纹理页", &renderer.spine.pages.len().to_string());
-                    metadata(ui, "三角形", &renderer.triangles.to_string());
-                }
-                if force {
-                    self.sync_animation(true);
-                }
-            });
+            }
+        }
         if paused != self.paused() {
             if let Some(runtime) = &self.runtime {
                 let ctx = ctx.clone();
@@ -731,6 +976,12 @@ impl App {
                 }
                 let available = ui.available_size();
                 let (rect, _) = ui.allocate_exact_size(available, Sense::hover());
+                let control_response = ui.interact(
+                    rect,
+                    keyboard::target_id(egui::ViewportId::ROOT),
+                    Sense::click(),
+                );
+                keyboard::focus_response(&control_response);
                 // Native windows can briefly report a tiny content area during
                 // creation or minimization, before their minimum size is applied.
                 if rect.width() <= 40.0 || rect.height() <= 100.0 {
@@ -783,12 +1034,23 @@ impl App {
                 };
                 let character = runtime.character_mut();
                 let height = (240.0 * self.prefs.config.display_scale).min(rect.height() * 0.7);
-                let mut size = renderer.size(height);
+                let size = renderer
+                    .desktop_layout(height, 1.0, ctx.pixels_per_point())
+                    .body
+                    .size();
                 let fit = ((rect.width() - 40.0) / size.x)
                     .min((rect.height() - 100.0) / size.y)
                     .min(1.0);
-                size *= fit;
-                character.resize(PetVec2::new(size.x, size.y));
+                let layout = renderer.desktop_layout(height * fit, 1.0, ctx.pixels_per_point());
+                let size = layout.body.size();
+                let body_size = PetVec2::new(size.x, size.y);
+                if self.first_position {
+                    character.resize(body_size);
+                } else {
+                    let delta = character.resize_around_feet(body_size);
+                    self.preview_presentation
+                        .translate_position(Vec2::new(delta.x, delta.y));
+                }
                 let bounds = Bounds::new(rect.width(), (rect.height() - 70.0).max(size.y));
                 character.set_position(character.position(), bounds);
                 if self.first_position {
@@ -803,18 +1065,25 @@ impl App {
                     character.set_direction(self.preview_direction);
                 }
                 if !paused {
-                    character.tick(dt, bounds);
+                    character.tick_controlled(dt, bounds, self.keyboard.walking());
                 }
                 self.preview_direction = character.animation().direction;
                 let p = character.position();
                 let (visual_position, _) = self.preview_presentation.position(
                     Pos2::new(p.x, p.y),
-                    character.physics().dragging,
+                    character.physics().dragging || self.keyboard.walking().is_some(),
                     &self.prefs.config,
                     now,
                 );
-                let mut target = Rect::from_min_size(rect.min + visual_position.to_vec2(), size);
+                let paint_at = |position: Pos2| {
+                    Rect::from_min_size(
+                        rect.min + position.to_vec2() + (layout.paint.min - layout.body.min),
+                        layout.paint.size(),
+                    )
+                };
+                let mut target = paint_at(visual_position);
                 let response = ui.interact(target, ui.id().with("pet"), Sense::click_and_drag());
+                keyboard::focus_response(&response);
                 let mut force = false;
                 if response.clicked() {
                     force |= character.click();
@@ -855,16 +1124,18 @@ impl App {
                         character.set_direction(direction);
                     }
                 }
+                if self.keyboard.prioritize_walk(character) {
+                    force = false;
+                }
                 self.preview_direction = character.animation().direction;
                 let p = character.position();
                 let (visual_position, moving) = self.preview_presentation.position(
                     Pos2::new(p.x, p.y),
-                    character.physics().dragging,
+                    character.physics().dragging || self.keyboard.walking().is_some(),
                     &self.prefs.config,
                     now,
                 );
-                target.min = rect.min + visual_position.to_vec2();
-                target.max = target.min + size;
+                target = paint_at(visual_position);
                 let (facing, turning) = self.preview_presentation.facing(
                     character.animation().direction,
                     &self.prefs.config,
@@ -893,7 +1164,7 @@ impl App {
                 painter.text(
                     rect.center_bottom() - Vec2::new(0.0, 28.0),
                     egui::Align2::CENTER_BOTTOM,
-                    &character.model().name,
+                    &self.catalog.models[self.catalog.representative(self.selected)].name,
                     FontId::proportional(18.0),
                     if self.prefs.dark { Color32::WHITE } else { INK },
                 );
@@ -1093,11 +1364,11 @@ impl App {
                 };
                 egui::ComboBox::from_label("边界大小").selected_text(coverage_label(canvas.coverage)).show_ui(ui, |ui| {
                     for value in [0.45, 0.65, 0.8, 0.9, 0.95] { ui.selectable_value(&mut canvas.coverage, value, coverage_label(value)); }
-                }).response.on_hover_text("根据所有动画采样的累计不透明度裁剪；阈值越高，边界通常越窄。");
+                }).response.on_hover_text("根据所有动画采样的累计不透明度裁剪；阈值越高，边界通常越窄。攻击和技能会额外预留挥动范围，避免武器被裁切。");
                 let sampling_label = |value| match value { 1 => "极精确", 4 => "精确", 16 => "粗略", 64 => "极粗略", _ => "自定义" };
                 egui::ComboBox::from_label("边界计算方式").selected_text(sampling_label(canvas.sampling_interval)).show_ui(ui, |ui| {
                     for value in [1, 4, 16, 64] { ui.selectable_value(&mut canvas.sampling_interval, value, sampling_label(value)); }
-                }).response.on_hover_text("以 30 FPS 为基准，分别每 1、4、16、64 帧抽样一次；只在载入或重新计算时执行。");
+                }).response.on_hover_text("累计不透明度以 30 FPS 为基准，分别每 1、4、16、64 帧抽样一次；攻击和技能范围独立细采样。只在载入或重新计算时执行。");
                 ui.small("修改后重新计算；不会重置当前动画或暂停状态。");
                 if ui.add_enabled(self.renderer.is_some(), egui::Button::new("重新计算边界")).clicked() {
                     if let Some(renderer) = &mut self.renderer {
@@ -1319,16 +1590,20 @@ impl App {
                     match result {
                         Ok(catalog) if !catalog.models.is_empty() => {
                             let root = path.parent().unwrap_or(Path::new(".")).to_owned();
-                            match Renderer::load(
-                                &catalog.models[0],
+                            match forms::Forms::load(
+                                &catalog,
+                                0,
                                 &root,
                                 self.prefs.config.rendering.canvas,
+                                &self.prefs.form_preferences,
                             ) {
-                                Ok(renderer) => {
-                                    let model = catalog.models[0].clone();
+                                Ok((forms, renderer)) => {
+                                    let active = forms.active;
+                                    let model = catalog.models[active].clone();
                                     self.catalog = catalog;
                                     self.asset_root = root;
-                                    self.install_model(0, model, renderer);
+                                    self.install_model(active, model, renderer);
+                                    self.forms = Some(forms);
                                     self.import_open = false;
                                 }
                                 Err(error) => self.error = Some(error),
@@ -1344,6 +1619,9 @@ impl App {
 
     fn desktop_builder(&mut self, ctx: &egui::Context) -> Option<egui::ViewportBuilder> {
         if !self.desktop_open {
+            if self.keyboard.owner() == Some(desktop_id()) {
+                self.cancel_keyboard();
+            }
             #[cfg(target_os = "macos")]
             if self.desktop_motion.is_some() {
                 ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::Visible(false));
@@ -1353,13 +1631,19 @@ impl App {
             self.desktop_presentation = transition::Presentation::default();
             self.desktop_effects = effects::EffectState::default();
             #[cfg(target_os = "macos")]
-            return self.desktop_viewport_builder(None);
+            return self.desktop_viewport_builder(ctx, None);
             #[cfg(not(target_os = "macos"))]
             return None;
         }
         let renderer = self.renderer.as_ref()?;
-        let size = renderer.size(180.0 * self.prefs.config.display_scale);
-        let window_size = size + Vec2::splat(2.0 * effects::padding(&self.prefs.config));
+        let layout = renderer.desktop_layout(
+            180.0 * self.prefs.config.display_scale,
+            effects::padding(&self.prefs.config),
+            self.desktop_motion
+                .as_ref()
+                .map_or(ctx.pixels_per_point(), |motion| motion.pixels_per_point),
+        );
+        let body_size = layout.body.size();
         #[cfg(target_os = "macos")]
         let opening = self.desktop_motion.is_none();
         if self.desktop_motion.is_none() {
@@ -1374,7 +1658,7 @@ impl App {
                 desktop::DesktopMotion::deploy(
                     areas,
                     primary,
-                    window_size,
+                    body_size,
                     self.prefs.initial_position,
                     pixels_per_point,
                 )
@@ -1393,25 +1677,42 @@ impl App {
         if opening {
             // A reused hidden viewport does not receive a UI callback until it is
             // visible again. Wake it here for both toolbar and menu requests.
-            ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::InnerSize(window_size));
             ctx.send_viewport_cmd_to(
                 desktop_id(),
-                egui::ViewportCommand::OuterPosition(motion.screen_position()),
+                egui::ViewportCommand::InnerSize(layout.window_size),
+            );
+            ctx.send_viewport_cmd_to(
+                desktop_id(),
+                egui::ViewportCommand::OuterPosition(
+                    motion.screen_position() - layout.body.min.to_vec2(),
+                ),
             );
             ctx.send_viewport_cmd_to(desktop_id(), egui::ViewportCommand::Visible(true));
             ctx.request_repaint_of(desktop_id());
         }
-        self.desktop_viewport_builder(Some(
-            motion
-                .last_window_position
-                .unwrap_or(motion.screen_position()),
-        ))
+        self.desktop_viewport_builder(
+            ctx,
+            Some(
+                motion
+                    .last_window_position
+                    .unwrap_or(motion.screen_position()),
+            ),
+        )
     }
 
-    fn desktop_viewport_builder(&self, position: Option<Pos2>) -> Option<egui::ViewportBuilder> {
+    fn desktop_viewport_builder(
+        &self,
+        ctx: &egui::Context,
+        position: Option<Pos2>,
+    ) -> Option<egui::ViewportBuilder> {
         let renderer = self.renderer.as_ref()?;
-        let window_size = renderer.size(180.0 * self.prefs.config.display_scale)
-            + Vec2::splat(2.0 * effects::padding(&self.prefs.config));
+        let layout = renderer.desktop_layout(
+            180.0 * self.prefs.config.display_scale,
+            effects::padding(&self.prefs.config),
+            self.desktop_motion
+                .as_ref()
+                .map_or(ctx.pixels_per_point(), |motion| motion.pixels_per_point),
+        );
         let builder = egui::ViewportBuilder::default()
             .with_title("ArkPets - 桌宠")
             .with_visible(false)
@@ -1420,7 +1721,7 @@ impl App {
             .with_transparent(true)
             // Native styles control taskbar visibility without recreating the viewport.
             .with_taskbar(false)
-            .with_inner_size(window_size)
+            .with_inner_size(layout.window_size)
             .with_resizable(false)
             .with_window_level(if self.prefs.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
@@ -1429,7 +1730,7 @@ impl App {
             })
             .with_mouse_passthrough(self.prefs.click_through);
         Some(if let Some(position) = position {
-            builder.with_position(position)
+            builder.with_position(position - layout.body.min.to_vec2())
         } else {
             builder
         })
@@ -1480,6 +1781,7 @@ impl App {
             0.0
         };
         self.advance(&ctx, dt);
+        self.handle_keyboard(&ctx);
         let paused = self.paused();
         let (opacity, opacity_animating) = self
             .desktop_opacity
@@ -1497,15 +1799,32 @@ impl App {
             return;
         };
         let character = runtime.character_mut();
-        let size = renderer.size(180.0 * self.prefs.config.display_scale);
         let padding = effects::padding(&self.prefs.config);
-        let window_size = size + Vec2::splat(2.0 * padding);
         let pixels_per_point = ctx.pixels_per_point();
+        let layout = renderer.desktop_layout(
+            180.0 * self.prefs.config.display_scale,
+            padding,
+            pixels_per_point,
+        );
+        let body_size = layout.body.size();
+        let canvas_offset = layout.body.min.to_vec2();
+        if ctx.input(|input| {
+            input.viewport().inner_rect.is_some_and(|rect| {
+                (rect.size() - layout.window_size).abs().max_elem() > 0.5 / pixels_per_point
+            })
+        }) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(layout.window_size));
+        }
         if started >= motion.next_work_area_update
             || motion.pixels_per_point != pixels_per_point
-            || motion.size != window_size
+            || motion.size != body_size
         {
             let old_scale = motion.pixels_per_point;
+            if let Some(profile) = &self.profile {
+                profile
+                    .record_desktop_geometry(layout.body, pixels_per_point)
+                    .expect("write diagnostic desktop geometry");
+            }
             motion.next_work_area_update = started + Duration::from_secs(1);
             if let Err(error) = desktop::movement_areas(
                 &ctx,
@@ -1514,8 +1833,8 @@ impl App {
                 self.prefs.multi_monitors,
             )
             .and_then(|(areas, primary)| {
-                motion.set_areas(areas, window_size, pixels_per_point)?;
-                motion.finish_deployment(primary, window_size);
+                motion.set_areas(areas, body_size, pixels_per_point)?;
+                motion.finish_deployment(primary, body_size);
                 Ok(())
             }) {
                 self.error = Some(format!("读取桌面工作区失败: {error}"));
@@ -1528,7 +1847,7 @@ impl App {
             if let Some(previous) = motion.last_window_position {
                 let previous = previous * factor;
                 motion.last_window_position = Some(previous);
-                let constrained = motion.constrain_display_position(previous, window_size);
+                let constrained = motion.constrain_display_position(previous, body_size);
                 if constrained.distance(previous) > 0.001 {
                     self.desktop_presentation
                         .reset_position(constrained, started);
@@ -1543,7 +1862,7 @@ impl App {
         let was_dragging = motion.body.dragging;
         #[cfg(debug_assertions)]
         if let Some(capture) = &mut self.capture {
-            capture.desktop(&ctx, self.frame_ms);
+            capture.desktop(&ctx, self.frame_ms, layout.body, motion.work_area.bottom());
         }
         if ctx.input(|input| input.viewport().close_requested()) {
             self.desktop_open = false;
@@ -1553,14 +1872,18 @@ impl App {
             input
                 .viewport()
                 .inner_rect
-                .map_or(motion.screen_position(), |rect| rect.min)
+                .map_or(motion.screen_position() - canvas_offset, |rect| rect.min)
         });
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
             .show(root_ui, |ui| {
-                let target = Rect::from_min_size(Pos2::new(padding, padding), size);
-                let response =
-                    ui.interact(target, ui.id().with("desktop-pet"), Sense::click_and_drag());
+                let target = layout.paint;
+                let response = ui.interact(
+                    target,
+                    keyboard::target_id(desktop_id()),
+                    Sense::click_and_drag(),
+                );
+                keyboard::focus_response(&response);
                 if response.clicked() && !self.prefs.click_through {
                     interacted |= character.click();
                 }
@@ -1573,9 +1896,13 @@ impl App {
                         .map(|p| window_origin + p.to_vec2());
                     match desktop::cursor_position(pixels_per_point, ctx.zoom_factor(), fallback) {
                         Ok(Some(cursor)) => {
-                            motion.start_drag_from_window(cursor, window_origin, window_size);
+                            motion.start_drag_from_window(
+                                cursor,
+                                window_origin + canvas_offset,
+                                body_size,
+                            );
                             if self.prefs.config.allow_interact {
-                                character.play_animation("Relax");
+                                character.play_idle();
                                 interacted = true;
                             }
                         }
@@ -1606,7 +1933,7 @@ impl App {
                                     motion.drag_to(
                                         cursor,
                                         ctx.input(|input| input.unstable_dt),
-                                        window_size,
+                                        body_size,
                                         self.prefs.config.physics.max_velocity,
                                     );
                                 }
@@ -1658,23 +1985,32 @@ impl App {
                     }
                 });
             });
+        if !motion.body.dragging && self.keyboard.prioritize_walk(character) {
+            interacted = false;
+        }
         let mut direction = character.animation().direction;
         if !paused && simulation_due {
-            motion.step(
-                dt,
-                window_size,
-                &self.prefs.config,
-                character.animation().animation == "Move",
-                &mut direction,
-            );
+            if let Some(control) = self.keyboard.walking().filter(|_| character.is_walking()) {
+                motion.step_controlled(dt, body_size, &self.prefs.config, control);
+                direction = control.direction;
+            } else {
+                motion.step(
+                    dt,
+                    body_size,
+                    &self.prefs.config,
+                    character.is_walking(),
+                    &mut direction,
+                );
+            }
             character.set_direction(direction);
         }
         // Avoid generating an OS move/redraw event for an unchanged pixel.
         let scale = ctx.pixels_per_point();
         let snap_position = motion.body.dragging
             || was_dragging
+            || self.keyboard.walking().is_some()
             || self.prefs.config.property_transition_duration == 0.0;
-        let (visual_target, reset) = match motion.display_target(window_size, snap_position) {
+        let (visual_target, reset) = match motion.display_target(body_size, snap_position) {
             Ok(target) => target,
             Err(error) => {
                 self.error = Some(error.to_string());
@@ -1696,7 +2032,7 @@ impl App {
         );
         properties_animating |= moving;
         let position =
-            match motion.display_position(visual_position, window_size, scale, snap_position) {
+            match motion.display_position(visual_position, body_size, scale, snap_position) {
                 Ok(position) => position,
                 Err(error) => {
                     self.error = Some(error.to_string());
@@ -1708,8 +2044,11 @@ impl App {
         properties_animating |= motion.last_window_position != Some(position)
             && position.distance(motion.screen_position()) > 1.0 / scale;
         let first_frame = motion.last_window_position.is_none();
-        if motion.last_window_position != Some(position) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+        let native_position = position - canvas_offset;
+        if motion.last_window_position != Some(position)
+            || window_origin.distance(native_position) > 0.5 / pixels_per_point
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(native_position));
             motion.last_window_position = Some(position);
         }
         if first_frame {
@@ -1843,6 +2182,7 @@ impl App {
                 .apply(PetCommand::SetAutomatic(self.prefs.automatic))
                 .unwrap();
         }
+        self.handle_keyboard(&ctx);
         // A visible preview must keep painting even when the desktop callback
         // owns Spine updates. Hidden and paused previews need no animation timer.
         if (!self.paused() || self.preview_properties_animating) && self.preview_visible(&ctx) {
@@ -2160,6 +2500,200 @@ fn renderer_name(cc: &eframe::CreationContext<'_>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_missing_paired_resource_does_not_replace_the_running_character() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let index = app
+            .catalog
+            .models
+            .iter()
+            .position(|model| model.id == "texas2")
+            .unwrap();
+        let battle = app
+            .catalog
+            .models
+            .iter()
+            .position(|model| model.id == "texas2-battle")
+            .unwrap();
+        app.catalog.models[battle].skeleton = "missing-form-resource.skel".into();
+        let selected = app.prefs.selected.clone();
+        let animations = app.renderer.as_ref().unwrap().spine.animations.as_ptr();
+        let sender = app.runtime.as_ref().unwrap().command_sender();
+        app.select(index, &ctx);
+        assert!(app
+            .error
+            .as_ref()
+            .is_some_and(|error| error.contains("missing-form-resource")));
+        assert_eq!(app.prefs.selected, selected);
+        assert_eq!(
+            app.renderer.as_ref().unwrap().spine.animations.as_ptr(),
+            animations
+        );
+        sender
+            .try_send(PetCommand::SetDirection(Direction::Left))
+            .unwrap();
+        app.advance(&ctx, 0.0);
+        assert_eq!(
+            app.runtime
+                .as_ref()
+                .unwrap()
+                .character()
+                .animation()
+                .direction,
+            Direction::Left
+        );
+    }
+
+    #[test]
+    fn explicit_forms_preserve_runtime_feet_velocity_pause_and_preferences() {
+        use arkpets::model::ModelForm;
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let index = app
+            .catalog
+            .models
+            .iter()
+            .position(|model| model.id == "texas2-battle")
+            .unwrap();
+        app.select(index, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.catalog.character_indices().len(), 7);
+        app.set_paused(true);
+        app.desktop_open = true;
+        app.desktop_builder(&ctx).unwrap();
+        let runtime = app.runtime.as_ref().unwrap() as *const _;
+        let sender = app.runtime.as_ref().unwrap().command_sender();
+        let anchor = |app: &App| {
+            let motion = app.desktop_motion.as_ref().unwrap();
+            motion.screen_position() + Vec2::new(motion.size.x * 0.5, motion.size.y)
+        };
+        let motion = app.desktop_motion.as_mut().unwrap();
+        motion.finish_deployment(motion.work_area, motion.size);
+        motion.body.velocity = PetVec2::new(17.0, 29.0);
+        let original = anchor(&app);
+        let battle_spine = app.renderer.as_ref().unwrap().spine.animations.as_ptr();
+        for (form, animation, unavailable, id) in [
+            (ModelForm::Base, "Move", "Skill_2_Loop", "texas2"),
+            (ModelForm::Battle, "Skill_2_Loop", "Move", "texas2-battle"),
+        ] {
+            app.select_form(form).unwrap();
+            let character = app.runtime.as_ref().unwrap().character();
+            assert_eq!(character.model().id, id);
+            assert_eq!(
+                character.available_animations(),
+                app.renderer.as_ref().unwrap().spine.animations
+            );
+            assert!(!character
+                .available_animations()
+                .iter()
+                .any(|name| name == unavailable));
+            let before = character.animation().clone();
+            assert!(app
+                .runtime
+                .as_mut()
+                .unwrap()
+                .apply(PetCommand::PlayAnimation(unavailable.into()))
+                .is_err());
+            assert_eq!(
+                *app.runtime.as_ref().unwrap().character().animation(),
+                before
+            );
+            sender
+                .try_send(PetCommand::PlayAnimation(animation.into()))
+                .unwrap();
+            app.advance(&ctx, 0.0);
+            assert!(app.error.is_none(), "{:?}", app.error);
+            assert_eq!(app.forms.as_ref().unwrap().active_form(), Some(form));
+            assert!(anchor(&app).distance(original) < 1e-3);
+            assert_eq!(
+                app.desktop_motion.as_ref().unwrap().body.velocity,
+                PetVec2::new(17.0, 29.0)
+            );
+            assert_eq!(app.runtime.as_ref().unwrap() as *const _, runtime);
+            assert!(app.paused());
+            assert_eq!(app.prefs.selected, id);
+        }
+        assert_eq!(
+            app.renderer.as_ref().unwrap().spine.animations.as_ptr(),
+            battle_spine
+        );
+        let restored: Preferences =
+            serde_json::from_str(&serde_json::to_string(&app.prefs).unwrap()).unwrap();
+        assert_eq!(restored.form_preferences, app.prefs.form_preferences);
+        app.select(app.catalog.representative(index), &ctx);
+        assert_eq!(
+            app.forms.as_ref().unwrap().active_form(),
+            Some(ModelForm::Battle)
+        );
+    }
+
+    #[test]
+    fn legacy_auto_form_preference_selects_one_skeleton_without_merging_actions() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let index = app
+            .catalog
+            .models
+            .iter()
+            .position(|model| model.id == "texas2-battle")
+            .unwrap();
+        let model = &app.catalog.models[index];
+        let preference = serde_json::json!({
+            "character_id": model.character_id,
+            "skin_id": model.skin_id,
+            "mode": "auto",
+            "preferred": "battle",
+        });
+        app.prefs.form_preferences = vec![serde_json::from_value(preference).unwrap()];
+        app.select(index, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(
+            app.forms.as_ref().unwrap().active_form(),
+            Some(arkpets::model::ModelForm::Battle)
+        );
+        let runtime = app.runtime.as_mut().unwrap();
+        assert!(runtime
+            .apply(PetCommand::PlayAnimation("Move".into()))
+            .is_err());
+        assert!(runtime.apply(PetCommand::Interact).is_err());
+        assert_eq!(runtime.character().animation().animation, "Idle");
+    }
+
+    #[test]
+    fn manual_keyboard_walk_releases_to_the_mouse_selected_action() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.prefs.automatic = false;
+        let runtime = app.runtime.as_mut().unwrap();
+        runtime.apply(PetCommand::SetAutomatic(false)).unwrap();
+        runtime
+            .apply(PetCommand::PlayAnimation("Sit".into()))
+            .unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        for pressed in [true, false] {
+            let mut input = egui::RawInput {
+                focused: true,
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .focused = Some(true);
+            input.events.push(egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            ctx.run_ui(input, |ui| app.update_ui(ui, &mut frame))
+                .drop_without_applying_deltas();
+            assert_eq!(app.animation_name, if pressed { "Move" } else { "Sit" });
+        }
+    }
+
     fn test_app(ctx: &egui::Context) -> App {
         // Feed monitor input explicitly, like RawInput below; unit tests do not
         // have a native event loop. Real window geometry is verified by scripts.
@@ -2184,6 +2718,7 @@ mod tests {
             runtime: None,
             renderer: None,
             compositor: renderer::Compositor::Recording,
+            forms: None,
             selected: 0,
             search: String::new(),
             favorites: Vec::new(),
@@ -2206,6 +2741,7 @@ mod tests {
             preview_direction: Direction::Right,
             preview_gesture: DirectionGesture::default(),
             animation_name: String::new(),
+            keyboard: keyboard::Control::default(),
             first_position: true,
             frame_ms: 0.0,
             gpu: String::new(),
@@ -2451,6 +2987,7 @@ mod tests {
         storage.0.insert("preferences".into(), r#"(config:(allowInteract:false,physics:(gravity:1200.0,drag:0.95,maxVelocity:(x:450.0,y:600.0),minVelocity:7.0,bounceDamping:0.2),transitionDuration:0.6,opacityTransitionDuration:0.1,opacityTransition:EASE_OUT_SINE),fps:30)"#.into());
         let mut prefs: Preferences = eframe::get_value(&storage, "preferences")
             .expect("old RON preferences remain readable");
+        assert!(prefs.form_preferences.is_empty());
         assert!(!prefs.config.allow_interact);
         assert!(prefs.config.allow_drag);
         assert_eq!(prefs.config.animation_mix_duration, 0.6);
@@ -2486,8 +3023,15 @@ mod tests {
             coverage: 0.65,
             sampling_interval: 16,
         };
+        prefs.form_preferences.push(forms::Preference {
+            character_id: "texas2".into(),
+            skin_id: "default".into(),
+            mode: forms::Mode::Battle,
+            preferred: arkpets::model::ModelForm::Battle,
+        });
         eframe::set_value(&mut storage, "preferences", &prefs);
         let restored: Preferences = eframe::get_value(&storage, "preferences").unwrap();
+        assert_eq!(restored.form_preferences, prefs.form_preferences);
         assert_eq!(restored.config.physics, prefs.config.physics);
         assert!(!restored.config.allow_drag);
         assert_eq!(restored.config.animation_mix_duration, 0.137);
@@ -2654,9 +3198,17 @@ mod tests {
         {
             motion.appearance_ready = true;
         }
-        let size = app.renderer.as_ref().unwrap().size(180.0)
-            + Vec2::splat(2.0 * effects::padding(&app.prefs.config));
-        motion.size = size;
+        motion.size = app
+            .renderer
+            .as_ref()
+            .unwrap()
+            .desktop_layout(
+                180.0,
+                effects::padding(&app.prefs.config),
+                ctx.pixels_per_point(),
+            )
+            .body
+            .size();
         motion.last_window_position = Some(motion.screen_position());
         let deadline = Instant::now() + Duration::from_secs(10);
         motion.next_work_area_update = deadline;
@@ -2830,6 +3382,43 @@ mod tests {
             app.desktop_motion.as_ref().unwrap().body.position,
             desktop_position
         );
+    }
+
+    #[test]
+    fn battle_playback_does_not_infer_transitions_in_either_mode() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let index = app
+            .catalog
+            .models
+            .iter()
+            .position(|model| model.id == "whitw2-battle")
+            .unwrap();
+        app.select(index, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.animation_name, "Idle");
+        let renderer = app.renderer.as_ref().unwrap();
+        assert!(renderer.bounds.is_finite() && renderer.bounds.is_positive());
+        assert!(renderer.triangles > 0);
+        let duration = renderer.spine.animation_duration("Attack").unwrap();
+        let sender = app.runtime.as_ref().unwrap().command_sender();
+        sender.try_send(PetCommand::SetAutomatic(false)).unwrap();
+        sender
+            .try_send(PetCommand::PlayAnimation("Attack".into()))
+            .unwrap();
+        for _ in 0..(duration * 60.0 * 2.5).ceil() as usize {
+            app.advance(&ctx, 1.0 / 60.0);
+        }
+        assert_eq!(app.animation_name, "Attack");
+        assert!(!app.prefs.automatic);
+        assert!(app.error.is_none(), "{:?}", app.error);
+
+        sender.try_send(PetCommand::SetAutomatic(true)).unwrap();
+        for _ in 0..(duration * 60.0 * 3.0).ceil() as usize {
+            app.advance(&ctx, 1.0 / 60.0);
+            assert_eq!(app.animation_name, "Attack");
+        }
+        assert!(app.error.is_none(), "{:?}", app.error);
     }
 
     #[test]

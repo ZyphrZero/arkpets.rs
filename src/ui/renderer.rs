@@ -163,6 +163,7 @@ pub struct Renderer {
     images: Arc<Vec<ColorImage>>,
     meshes: Vec<MeshPart>,
     pub bounds: Rect,
+    canvas_bounds: Rect,
     reference_height: f32,
     pub vertices: usize,
     pub triangles: usize,
@@ -172,6 +173,15 @@ pub struct Renderer {
     pub canvas_settings: arkpets::config::CanvasSettings,
     pub effective_canvas_coverage: f32,
     pub canvas_samples: usize,
+}
+
+/// Logical coordinates inside the native window. Only `body` participates in
+/// desktop physics. Its bottom is the skeleton's y=0 ground, independent of
+/// animation cropping and the canvas space reserved for effects.
+pub struct DesktopLayout {
+    pub body: Rect,
+    pub paint: Rect,
+    pub window_size: Vec2,
 }
 
 impl Renderer {
@@ -191,13 +201,12 @@ impl Renderer {
         let skeleton_path = root.join(&model.skeleton);
         let atlas_path = root.join(&model.atlas);
         let mut spine = Spine::load(&skeleton_path, &atlas_path).map_err(|e| e.to_string())?;
-        let initial = spine
-            .animations
-            .iter()
-            .find(|name| matches!(name.as_str(), "Relax" | "Idle" | "Stand"))
-            .unwrap_or(&spine.animations[0])
-            .clone();
-        spine.play(&initial, true).map_err(|e| e.to_string())?;
+        let initial = arkpets::animation::initial_animation(&spine.animations)
+            .ok_or("模型没有可播放的动画")?
+            .to_owned();
+        spine
+            .play(&initial, arkpets::animation::animation_loops(&initial))
+            .map_err(|e| e.to_string())?;
         spine.update(0.0, 0.3);
         let mut meshes = Vec::new();
         spine.meshes(&mut meshes);
@@ -231,6 +240,7 @@ impl Renderer {
             images: Arc::new(images),
             meshes,
             bounds: calculation.rect,
+            canvas_bounds: calculation.canvas_rect,
             reference_height: bounds.height(),
             vertices: 0,
             triangles: 0,
@@ -262,6 +272,7 @@ impl Renderer {
             settings,
         )?;
         self.bounds = calculation.rect;
+        self.canvas_bounds = calculation.canvas_rect;
         self.canvas_settings = settings;
         self.effective_canvas_coverage = calculation.effective_coverage;
         self.canvas_samples = calculation.samples;
@@ -282,6 +293,48 @@ impl Renderer {
     pub fn size(&self, height: f32) -> Vec2 {
         // Cropping changes the canvas, not the skeleton's world-to-screen scale.
         self.bounds.size() * (height / self.reference_height)
+    }
+
+    pub fn desktop_layout(
+        &self,
+        height: f32,
+        padding: f32,
+        pixels_per_point: f32,
+    ) -> DesktopLayout {
+        let scale = height / self.reference_height;
+        let align = |value: Vec2| (value * scale * pixels_per_point).ceil() / pixels_per_point;
+        // Java keeps the skeleton origin at the camera's bottom when cropping.
+        // Using the animation crop's minimum Y instead makes below-ground
+        // attachments (especially Relax/Sleep) lift the entire pet off the floor.
+        let body_top = self.bounds.max.y.max(0.0);
+        let before = align(Vec2::new(
+            self.bounds.min.x - self.canvas_bounds.min.x,
+            (self.canvas_bounds.max.y - body_top).max(0.0),
+        ));
+        let after = align(Vec2::new(
+            self.canvas_bounds.max.x - self.bounds.max.x,
+            self.bounds.min.y - self.canvas_bounds.min.y,
+        ));
+        let size = self.size(height);
+        let body = Rect::from_min_size(
+            Pos2::ZERO + before,
+            Vec2::new(size.x + 2.0 * padding, body_top * scale + padding),
+        );
+        let paint = Rect::from_min_size(
+            Pos2::ZERO
+                + before
+                + Vec2::new(padding, padding + (body_top - self.bounds.max.y) * scale),
+            size,
+        );
+        let window_size = Vec2::new(
+            body.right() + after.x,
+            (paint.bottom() + after.y).max(body.bottom()) + padding,
+        );
+        DesktopLayout {
+            body,
+            paint,
+            window_size: (window_size * pixels_per_point).ceil() / pixels_per_point,
+        }
     }
 
     #[cfg(test)]
@@ -501,6 +554,73 @@ mod tests {
     }
 
     #[test]
+    fn battle_attack_geometry_fits_the_desktop_canvas() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let catalog = arkpets::ModelCatalog::from_json_file(root.join("models.json")).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.id == "whitw2-battle")
+            .unwrap();
+        let mut renderer = Renderer::load(model, &root, Default::default()).unwrap();
+        let original_scale = renderer.size(180.0).y / renderer.bounds.height();
+        for settings in [
+            Default::default(),
+            arkpets::config::CanvasSettings {
+                coverage: 0.95,
+                sampling_interval: 64,
+            },
+        ] {
+            renderer.recalculate_bounds(settings).unwrap();
+            assert!(
+                (renderer.size(180.0).y / renderer.bounds.height() - original_scale).abs() < 1e-6
+            );
+            for name in ["Attack", "Skill_1_Loop", "Skill_2_Loop", "Skill_3_Loop"] {
+                let duration = renderer.spine.animation_duration(name).unwrap();
+                let mut geometry = Rect::NOTHING;
+                // Check between the 240 Hz precomputation samples as well.
+                for frame in 0..=(duration * 480.0).ceil() as usize {
+                    renderer
+                        .spine
+                        .sample_animation(name, (frame as f32 / 480.0).min(duration))
+                        .unwrap();
+                    renderer.spine.meshes(&mut renderer.meshes);
+                    for mesh in &renderer.meshes {
+                        if mesh.color[3] > 0.0 {
+                            for &index in &mesh.indices {
+                                let [x, y] = mesh.positions[usize::from(index)];
+                                geometry.extend_with(Pos2::new(x, y));
+                            }
+                        }
+                    }
+                    for scale in [0.5, 1.0, 1.7] {
+                        let layout = renderer.desktop_layout(180.0 * scale, 12.0, 1.5);
+                        let window = Rect::from_min_size(Pos2::ZERO, layout.window_size);
+                        let target = layout.paint;
+                        for facing in [-1.0, 1.0] {
+                            for mesh in
+                                mesh_batches(&renderer.meshes, renderer.bounds, target, facing)
+                            {
+                                for &index in &mesh.indices {
+                                    let vertex = &mesh.vertices[index as usize];
+                                    if vertex.color.a() > 0 {
+                                        assert!(window.contains(vertex.pos), "{name} frame {frame}: {facing}, {scale}, vertex {:?} escapes {window:?}", vertex.pos);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    renderer.canvas_bounds.contains_rect(geometry),
+                    "desktop canvas {:?} clips {name} geometry {geometry:?}",
+                    renderer.canvas_bounds
+                );
+            }
+        }
+    }
+
+    #[test]
     fn real_models_submit_global_opacity_separately_from_slot_colors() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
         let catalog = arkpets::ModelCatalog::from_json_file(root.join("models.json")).unwrap();
@@ -545,6 +665,126 @@ mod tests {
                 output.drop_without_applying_deltas();
             }
         }
+    }
+
+    #[test]
+    fn battle_canvas_overhang_preserves_floor_and_drag_anchor_across_dpi() {
+        use super::super::desktop::DesktopMotion;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let catalog = arkpets::ModelCatalog::from_json_file(root.join("models.json")).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.id == "whitw2-battle")
+            .unwrap();
+        let renderer = Renderer::load(model, &root, Default::default()).unwrap();
+        let config = arkpets::PetConfig::default();
+        let padding = super::super::effects::padding(&config);
+        for dpi in [1.0, 1.5, 2.0] {
+            for display_scale in [0.5, 1.0, 1.7] {
+                let layout = renderer.desktop_layout(180.0 * display_scale, padding, dpi);
+                let body_size = layout.body.size();
+                assert!(layout.window_size.y > body_size.y);
+                // 48 px represents a system work-area inset; the other values
+                // represent manually configured physical-pixel bottom heights.
+                for inset in [48.0, 0.0, 120.0, 200.0] {
+                    let floor = (2160.0 - inset) / dpi;
+                    let area =
+                        Rect::from_min_max(Pos2::new(-3840.0 / dpi, 0.0), Pos2::new(0.0, floor));
+                    let mut motion =
+                        DesktopMotion::deploy(vec![area], area, body_size, [0.2, 0.2], dpi)
+                            .unwrap();
+                    motion.finish_deployment(area, body_size);
+                    for _ in 0..240 {
+                        motion.step(1.0 / 60.0, body_size, &config, false, &mut Direction::Right);
+                    }
+                    let position = motion
+                        .display_position(motion.screen_position(), body_size, dpi, true)
+                        .unwrap();
+                    let window_origin = position - layout.body.min.to_vec2();
+                    let displayed_floor = window_origin.y + layout.body.bottom();
+                    assert!((displayed_floor - floor).abs() <= 1.0 / dpi + 1e-4);
+                    let ground = layout.paint.top()
+                        + renderer.bounds.max.y
+                            * (180.0 * display_scale / renderer.reference_height);
+                    assert!((window_origin.y + ground - floor).abs() <= 1.0 / dpi + 1e-4);
+                    let cursor = window_origin + layout.paint.center().to_vec2();
+                    motion.start_drag_from_window(
+                        cursor,
+                        window_origin + layout.body.min.to_vec2(),
+                        body_size,
+                    );
+                    motion.drag_to(cursor, 1.0 / 60.0, body_size, config.physics.max_velocity);
+                    assert!(motion.screen_position().distance(position) < 1e-3);
+                    assert!(
+                        motion.body.velocity.x.abs() < 1e-2 && motion.body.velocity.y.abs() < 1e-2
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_models_align_visible_standing_ground_with_the_taskbar() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let catalog = arkpets::ModelCatalog::from_json_file(root.join("models.json")).unwrap();
+        let mut gaps = Vec::new();
+        for model in &catalog.models {
+            let mut renderer = Renderer::load(model, &root, Default::default()).unwrap();
+            let ground = bounds::standing_ground(&renderer.meshes, &renderer.images).unwrap();
+            let layout = renderer.desktop_layout(180.0, 12.0, 1.0);
+            let visible_ground = layout.paint.top()
+                + (renderer.bounds.max.y - ground) * (180.0 / renderer.reference_height);
+            eprintln!(
+                "{}: crop bottom {}, visible ground {}, screen gap {}",
+                model.id,
+                renderer.bounds.min.y,
+                ground,
+                layout.body.bottom() - visible_ground
+            );
+            gaps.push((model.id.clone(), layout.body.bottom() - visible_ground));
+            for settings in [
+                Default::default(),
+                arkpets::config::CanvasSettings {
+                    coverage: 0.95,
+                    sampling_interval: 64,
+                },
+            ] {
+                renderer.recalculate_bounds(settings).unwrap();
+                for dpi in [1.0, 1.5, 2.0] {
+                    for height in [90.0, 180.0, 306.0] {
+                        for padding in [4.0, 12.0, 24.0] {
+                            let layout = renderer.desktop_layout(height, padding, dpi);
+                            assert!(layout.body.is_positive());
+                            assert!(Rect::from_min_size(Pos2::ZERO, layout.window_size)
+                                .contains_rect(layout.paint));
+                            for facing in [-1.0, 1.0] {
+                                // Inspect the actual submitted mesh transform. Every vertex's
+                                // height above the floor must follow its original Spine Y.
+                                let source =
+                                    renderer.meshes.iter().flat_map(|part| &part.positions);
+                                let rendered = mesh_batches(
+                                    &renderer.meshes,
+                                    renderer.bounds,
+                                    layout.paint,
+                                    facing,
+                                )
+                                .flat_map(|mesh| mesh.vertices);
+                                for (source, vertex) in source.zip(rendered) {
+                                    let height_above_floor = layout.body.bottom() - vertex.pos.y;
+                                    assert!((height_above_floor - source[1] * height / renderer.reference_height).abs() < 1e-3,
+                                        "{}: crop/scale/DPI/effect padding changed the skeleton ground", model.id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            gaps.iter().all(|(_, gap)| gap.abs() < 1.0),
+            "standing ground must coincide with the physical floor: {gaps:?}"
+        );
     }
 
     #[test]

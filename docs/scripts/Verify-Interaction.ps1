@@ -3,6 +3,9 @@ param(
     [ValidateSet('dx12', 'opengl')][string]$Renderer = 'dx12',
     [switch]$DesktopSettings,
     [switch]$BehaviorSettings,
+    [switch]$KeyboardControls,
+    [switch]$FormControls,
+    [ValidateSet('auto', 'base', 'battle')][string]$FormMode = 'auto',
     [string]$OutputDirectory
 )
 
@@ -38,6 +41,7 @@ public static class ArkPetsInteraction {
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point point);
     [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr window, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint count, Input[] inputs, int size);
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
@@ -113,19 +117,30 @@ function Assert-SampleRunning {
     if ($process.HasExited) { throw "The sample process exited during $($report.stage) with code $($process.ExitCode)" }
 }
 
-function Read-WindowRect([IntPtr]$Window) {
-    $rect = New-Object ArkPetsInteraction+Rect
-    if (-not [ArkPetsInteraction]::GetWindowRect($Window, [ref]$rect) -or $rect.Right -le $rect.Left -or $rect.Bottom -le $rect.Top) {
-        throw "Cannot read a live sample window rectangle: $Window"
+function Read-BodyRect([IntPtr]$Window) {
+    $geometry = Get-Content -LiteralPath (Join-Path $outputPath 'desktop-geometry.json') -Raw | ConvertFrom-Json
+    $origin = Client-ScreenPoint $Window 0 0
+    $scale = $geometry.pixels_per_point
+    [pscustomobject]@{
+        x = $origin.X + $geometry.body.x * $scale
+        y = $origin.Y + $geometry.body.y * $scale
+        width = $geometry.body.width * $scale
+        height = $geometry.body.height * $scale
     }
-    [pscustomobject]@{ x = $rect.Left; y = $rect.Top; width = $rect.Right - $rect.Left; height = $rect.Bottom - $rect.Top }
 }
 
 function Show-SampleWindow([IntPtr]$Window, [string]$Name) {
     $visible = [ArkPetsInteraction]::IsWindowVisible($Window)
     Write-InteractionLog "$Name native visibility before show: $visible (HWND $Window)"
-    if (-not $visible) { [ArkPetsInteraction]::ShowWindow($Window, 4) | Out-Null }
-    if (-not [ArkPetsInteraction]::IsWindowVisible($Window)) { throw "$Name did not become visible" }
+    $ready = [Diagnostics.Stopwatch]::StartNew()
+    while (-not [ArkPetsInteraction]::IsWindowVisible($Window)) {
+        Assert-SampleRunning
+        if ($ready.ElapsedMilliseconds -gt 15000) { throw "$Name did not become visible" }
+        # A HWND can exist before the paired resources finish loading and the
+        # initial viewport visibility commands have been applied.
+        [ArkPetsInteraction]::ShowWindow($Window, 4) | Out-Null
+        Start-Sleep -Milliseconds 50
+    }
     if (-not [ArkPetsInteraction]::SetWindowPos($Window, [IntPtr](-1), 0, 0, 0, 0, 0x13)) { throw "Cannot raise $Name above the host application" }
 }
 
@@ -225,11 +240,75 @@ function Wait-Floor([IntPtr]$Window, [int]$Floor) {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
         Assert-SampleRunning
-        $rect = Read-WindowRect $Window
+        $rect = Read-BodyRect $Window
         if ([Math]::Abs($rect.y + $rect.height - $Floor) -le 2) { return }
         Start-Sleep -Milliseconds 50
     } while ($timer.ElapsedMilliseconds -lt 5000)
     throw "Pet bottom $($rect.y + $rect.height) did not reach expected floor $Floor"
+}
+
+function Find-PetPoint([IntPtr]$Window) {
+    $body = Read-BodyRect $Window
+    foreach ($y in @(0.4, 0.3, 0.5, 0.6, 0.2, 0.7)) {
+        foreach ($x in @(0.5, 0.4, 0.6, 0.3, 0.7)) {
+            $point = New-Object ArkPetsInteraction+Point
+            $point.X = [int]($body.x + $body.width * $x)
+            $point.Y = [int]($body.y + $body.height * $y)
+            if ([ArkPetsInteraction]::GetAncestor([ArkPetsInteraction]::WindowFromPoint($point), 2) -eq $Window) { return $point }
+        }
+    }
+    throw 'No point in the sample pet body targets its own native window'
+}
+
+function Assert-KeyboardTarget([IntPtr]$Window) {
+    $foreground = [ArkPetsInteraction]::GetAncestor([ArkPetsInteraction]::GetForegroundWindow(), 2)
+    if ($foreground -ne $Window) { throw "Keyboard target is $foreground instead of sample HWND $Window; no key was sent" }
+}
+
+function Wait-ControlState([string]$Animation, [bool]$Walking) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Assert-SampleRunning
+        $stream = [IO.File]::Open((Join-Path $outputPath 'controls.json'), [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $reader = [IO.StreamReader]::new($stream)
+        try { $state = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        if (($state.walking -eq $Walking) -and (-not $Animation -or $state.animation -eq $Animation)) { return $state }
+        Start-Sleep -Milliseconds 25
+    } while ($timer.ElapsedMilliseconds -lt 3000)
+    throw "Control state did not become animation=$Animation walking=$Walking; observed $($state | ConvertTo-Json -Compress)"
+}
+
+function Hold-Walk([IntPtr]$FocusWindow, [bool]$Fast, [string]$Moving = 'Move', [string]$Resting = 'Sit', [string]$MovingForm = '', [string]$RestingForm = '') {
+    Assert-KeyboardTarget $FocusWindow
+    $before = Read-BodyRect $pet
+    if ($Fast) { [ArkPetsInteraction]::Key(0x11, $true) }
+    [ArkPetsInteraction]::Key(0x27, $true)
+    try {
+        $state = Wait-ControlState $Moving $true
+        if ($MovingForm -and $state.form -ne $MovingForm) { throw "Movement used form $($state.form), expected $MovingForm" }
+        if ($state.fast -ne $Fast -or $state.walk_speed -ne 30) { throw 'Acceleration changed the saved speed or failed to follow Ctrl' }
+        Start-Sleep -Milliseconds 700
+    } finally {
+        [ArkPetsInteraction]::Key(0x27, $false)
+        if ($Fast) { [ArkPetsInteraction]::Key(0x11, $false) }
+    }
+    $state = Wait-ControlState $Resting $false
+    if ($RestingForm -and $state.form -ne $RestingForm) { throw "Release used form $($state.form), expected $RestingForm" }
+    Start-Sleep -Milliseconds 500
+    $after = Read-BodyRect $pet
+    return $after.x - $before.x
+}
+
+function Select-KeyboardAction([string]$Animation) {
+    Assert-KeyboardTarget $pet
+    for ($attempt = 0; $attempt -lt 12; $attempt++) {
+        $state = Wait-ControlState '' $false
+        if ($state.animation -eq $Animation) { return }
+        [ArkPetsInteraction]::Key(0x28, $true)
+        try { Start-Sleep -Milliseconds 60 } finally { [ArkPetsInteraction]::Key(0x28, $false) }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Keyboard could not select $Animation"
 }
 
 try {
@@ -245,7 +324,8 @@ try {
     $start.EnvironmentVariables['ARKPETS_PROFILE_DIR'] = $outputPath
     $start.EnvironmentVariables['ARKPETS_PROFILE_SECONDS'] = '120'
     $start.EnvironmentVariables['ARKPETS_PROFILE_WARMUP'] = '2'
-    $start.EnvironmentVariables['ARKPETS_PROFILE_MODEL'] = 'pepe'
+    $start.EnvironmentVariables['ARKPETS_PROFILE_MODEL'] = if ($FormControls) { 'texas2-battle' } else { 'pepe' }
+    $start.EnvironmentVariables['ARKPETS_PROFILE_FORM'] = $FormMode
     $start.EnvironmentVariables['ARKPETS_PROFILE_FPS'] = '60'
     $start.EnvironmentVariables.Remove('ARKPETS_CAPTURE_DIR')
     $process.StartInfo = $start
@@ -273,11 +353,11 @@ try {
     $report.stage = 'settle'
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $stable = 0
-    $previous = Read-WindowRect $pet
+    $previous = Read-BodyRect $pet
     do {
         Start-Sleep -Milliseconds 100
         Assert-SampleRunning
-        $current = Read-WindowRect $pet
+        $current = Read-BodyRect $pet
         if ([Math]::Abs($current.x - $previous.x) -le 1 -and [Math]::Abs($current.y - $previous.y) -le 1) { $stable++ } else { $stable = 0 }
         $previous = $current
     } while (($stable -lt 6 -or [Math]::Abs($current.y + $current.height - $work.Work.Bottom) -gt 3) -and $timer.ElapsedMilliseconds -lt 10000)
@@ -292,13 +372,13 @@ try {
     $report.stage = 'hover'
     $client = New-Object ArkPetsInteraction+Rect
     if (-not [ArkPetsInteraction]::GetClientRect($pet, [ref]$client)) { throw 'Cannot read desktop pet client area' }
-    $anchor = Client-ScreenPoint $pet ($client.Right / 2.0) ($client.Bottom * 0.6)
+    $anchor = Find-PetPoint $pet
     for ($index = 0; $index -lt 24; $index++) {
         if (([ArkPetsInteraction]::GetAsyncKeyState(1) -band 0x8000) -ne 0) { throw 'A mouse button was held during the hover-only sample' }
         $offset = if (($index % 2) -eq 0) { -12 } else { 12 }
         Move-Pointer ($anchor.X + [int]($offset * $dpi / 96.0)) $anchor.Y
         Start-Sleep -Milliseconds 60
-        $rect = Read-WindowRect $pet
+        $rect = Read-BodyRect $pet
         $hoverSamples.Add($rect)
         if ([Math]::Abs($rect.x - $initial.x) -gt 2 -or [Math]::Abs($rect.y - $initial.y) -gt 2) {
             throw "Hover moved the desktop pet: initial $($initial.x),$($initial.y), observed $($rect.x),$($rect.y)"
@@ -318,7 +398,7 @@ try {
         $dy = [int][Math]::Round(-60.0 * $step / 16)
         Move-Pointer ($anchor.X + $dx) ($anchor.Y + $dy)
         Start-Sleep -Milliseconds 40
-        $rect = Read-WindowRect $pet
+        $rect = Read-BodyRect $pet
         $dragSamples.Add([pscustomobject]@{ step = $step; cursor_dx = $dx; cursor_dy = $dy; rect = $rect })
         if ($rect.x -lt $work.Work.Left - 2 -or $rect.y -lt $work.Work.Top - 2 -or $rect.x + $rect.width -gt $work.Work.Right + 2 -or $rect.y + $rect.height -gt $work.Work.Bottom + 2) {
             throw 'Desktop pet escaped the monitor work area while dragging'
@@ -328,7 +408,7 @@ try {
         }
     }
     Start-Sleep -Milliseconds 250
-    $held = Read-WindowRect $pet
+    $held = Read-BodyRect $pet
     $report.drag_held = $held
     if ([Math]::Abs(($held.x - $initial.x) - 80) -gt 20 -or [Math]::Abs(($held.y - $initial.y) + 60) -gt 20) {
         throw "Held drag did not follow 80,-60 cursor displacement: observed $($held.x - $initial.x),$($held.y - $initial.y)"
@@ -351,6 +431,78 @@ try {
         Start-Sleep -Milliseconds 25
     }
     Write-InteractionLog 'ROOT interaction PASS: desktop toggle reopened a visible native pet window'
+
+    if ($FormControls) {
+        $report.stage = 'form_controls'
+        Wait-Floor $pet $work.Work.Bottom
+        Show-SampleWindow $pet 'Form pet'
+        $point = Find-PetPoint $pet
+        $origin = Client-ScreenPoint $pet 0 0
+        $scale = [ArkPetsInteraction]::GetDpiForWindow($pet) / 96.0
+        Click-Client $pet (($point.X - $origin.X) / $scale) (($point.Y - $origin.Y) / $scale)
+        $resting = if ($FormMode -eq 'base') { 'Relax' } else { 'Idle' }
+        $restingForm = if ($FormMode -eq 'base') { 'base' } else { 'battle' }
+        Select-KeyboardAction $resting
+        if ($FormMode -eq 'base') {
+            $normal = Hold-Walk $pet $false 'Move' $resting 'base' 'base'
+            $fast = Hold-Walk $pet $true 'Move' $resting 'base' 'base'
+            if ($normal -lt 10 -or $fast -lt $normal * 1.5 -or $fast -gt $normal * 2.7) { throw "Form movement failed: $normal / $fast" }
+            $report.forms = [ordered]@{ form='base'; normal_dx=$normal; fast_dx=$fast }
+        } else {
+            Select-KeyboardAction 'Skill_2_Loop'
+            Assert-KeyboardTarget $pet
+            $before = Read-BodyRect $pet
+            [ArkPetsInteraction]::Key(0x27, $true)
+            try {
+                Start-Sleep -Milliseconds 700
+                $state = Wait-ControlState 'Skill_2_Loop' $false
+                if ($state.form -ne 'battle') { throw 'Movement key switched the battle skeleton' }
+            } finally { [ArkPetsInteraction]::Key(0x27, $false) }
+            $after = Read-BodyRect $pet
+            if ([Math]::Abs($after.x - $before.x) -gt 2) { throw 'Battle model moved without its own Move animation' }
+            $report.forms = [ordered]@{ form='battle'; displacement=$after.x-$before.x }
+        }
+        Wait-Floor $pet $work.Work.Bottom
+        Write-InteractionLog "Forms PASS: explicit form=$restingForm, keyboard input keeps the selected skeleton and floor"
+    }
+
+    if ($KeyboardControls) {
+        $report.stage = 'keyboard_controls'
+        Wait-Floor $pet $work.Work.Bottom
+        Show-SampleWindow $pet 'Keyboard pet'
+        $client = New-Object ArkPetsInteraction+Rect
+        if (-not [ArkPetsInteraction]::GetClientRect($pet, [ref]$client)) { throw 'Cannot read pet client size' }
+        $petScale = [ArkPetsInteraction]::GetDpiForWindow($pet) / 96.0
+        Click-Client $pet ($client.Right / $petScale / 2) ($client.Bottom / $petScale * 0.4)
+        Assert-KeyboardTarget $pet
+        Select-KeyboardAction 'Sit'
+        $normal = Hold-Walk $pet $false
+        $fast = Hold-Walk $pet $true
+        if ($normal -lt 10 -or $fast -lt $normal * 1.5 -or $fast -gt $normal * 2.7) {
+            throw "Keyboard displacement was not normal/double speed: $normal / $fast physical pixels"
+        }
+        $report.keyboard = [ordered]@{ normal_dx = $normal; accelerated_dx = $fast }
+        Write-InteractionLog "Keyboard movement PASS: $normal / $fast physical pixels; release restored Sit"
+        Assert-KeyboardTarget $pet
+        [ArkPetsInteraction]::Key(0x27, $true)
+        try {
+            $null = Wait-ControlState 'Move' $true
+            Click-Client $root 700 400
+            $null = Wait-ControlState 'Sit' $false
+            Start-Sleep -Milliseconds 500
+            $stopped = Read-BodyRect $pet
+            Start-Sleep -Milliseconds 400
+            $later = Read-BodyRect $pet
+            if ([Math]::Abs($later.x - $stopped.x) -gt 2) { throw 'Losing focus left a keyboard movement running' }
+        } finally { [ArkPetsInteraction]::Key(0x27, $false) }
+        Write-InteractionLog 'Keyboard focus PASS: switching to the settings window stopped movement while the key was still held'
+        Click-Client $root 100 110
+        Click-Client $root 600 320
+        $fromPreview = Hold-Walk $root $false
+        if ($fromPreview -lt 10) { throw 'Keyboard input from the preview did not reach the shared desktop pet' }
+        $report.keyboard.preview_dx = $fromPreview
+        Write-InteractionLog "Shared preview keyboard PASS: desktop displacement $fromPreview physical pixels"
+    }
 
     if ($DesktopSettings) {
         $report.stage = 'desktop_settings'
@@ -423,7 +575,7 @@ try {
         Click-DesktopToggle $root
         $pet = Wait-SampleWindow $true $true 2500
         Start-Sleep -Milliseconds 500
-        $rect = Read-WindowRect $pet
+        $rect = Read-BodyRect $pet
         $work.Size = [Runtime.InteropServices.Marshal]::SizeOf($work)
         if (-not [ArkPetsInteraction]::GetMonitorInfo([ArkPetsInteraction]::MonitorFromWindow($pet, 2), [ref]$work)) { throw 'Cannot read deployment monitor' }
         $expectedX = $work.Work.Left + ($work.Work.Right - $work.Work.Left - $rect.width) * 0.8
@@ -447,6 +599,14 @@ try {
             if (-not $saved.Contains($expected)) { throw "Behavior preference was not persisted: $expected" }
         }
         Write-InteractionLog 'Behavior settings PASS: speed, activity, direction mode, multi-monitor switch and deployment persisted'
+    }
+    if ($FormControls) {
+        $saved = Get-Content -LiteralPath (Join-Path $outputPath 'test-preferences.ron') -Raw
+        $savedForm = if ($FormMode -eq 'base') { 'base' } else { 'battle' }
+        $savedModel = if ($savedForm -eq 'base') { 'texas2' } else { 'texas2-battle' }
+        foreach ($expected in @(('selected:\"{0}\"' -f $savedModel), "mode:$savedForm", "preferred:$savedForm")) {
+            if (-not $saved.Contains($expected)) { throw "Form preference not persisted: $expected" }
+        }
     }
     $report.stage = 'complete'
     $report.success = $true

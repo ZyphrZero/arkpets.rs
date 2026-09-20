@@ -75,6 +75,14 @@ impl CharacterState {
     pub fn available_animations(&self) -> &[String] {
         self.animation.available()
     }
+    pub fn is_walking(&self) -> bool {
+        self.animation.state.animation == "Move"
+    }
+    pub fn play_idle(&mut self) -> bool {
+        let initial =
+            crate::animation::initial_animation(self.available_animations()).map(str::to_owned);
+        initial.is_some_and(|name| self.animation.play(name))
+    }
     pub fn physics(&self) -> &PhysicsState {
         &self.physics
     }
@@ -103,6 +111,19 @@ impl CharacterState {
     pub fn resize(&mut self, size: Vec2) {
         self.size = size;
     }
+
+    pub fn resize_around_feet(&mut self, size: Vec2) -> Vec2 {
+        let delta = Vec2::new((self.size.x - size.x) * 0.5, self.size.y - size.y);
+        self.physics.translate(delta);
+        self.size = size;
+        delta
+    }
+
+    pub fn set_model_form(&mut self, model: CharacterModel) {
+        self.animation
+            .set_available(model.animations.clone(), &self.config);
+        self.model = model;
+    }
     pub fn set_position(&mut self, position: Vec2, bounds: Bounds) {
         self.physics.position = Vec2::new(
             position.x.clamp(0.0, bounds.max_position(self.size).x),
@@ -111,18 +132,35 @@ impl CharacterState {
     }
 
     pub fn tick(&mut self, dt: f32, bounds: Bounds) {
+        self.tick_controlled(dt, bounds, None);
+    }
+
+    pub fn tick_controlled(
+        &mut self,
+        dt: f32,
+        bounds: Bounds,
+        control: Option<crate::interaction::WalkControl>,
+    ) {
         if self.hidden {
             return;
         }
         self.animation.tick(dt);
-        let walking = if self.config.allow_walk && self.animation.state.animation == "Move" {
-            Some((self.animation.state.direction, self.config.walk_speed))
+        if let Some(control) = control {
+            self.set_direction(control.direction);
+        }
+        let walking = if self.config.allow_walk && self.is_walking() {
+            Some((
+                self.animation.state.direction,
+                control.map_or(self.config.walk_speed, |control| {
+                    control.speed(self.config.walk_speed)
+                }),
+            ))
         } else {
             None
         };
         self.physics
             .step(dt, bounds, self.size, self.config.physics, walking);
-        if walking.is_some() && !self.physics.dragging {
+        if walking.is_some() && !self.physics.dragging && control.is_none() {
             if self.physics.position.x <= 0.0 {
                 self.animation.set_direction(crate::Direction::Right);
             } else if self.physics.position.x >= bounds.max_position(self.size).x {
@@ -141,11 +179,7 @@ impl CharacterState {
 
     pub fn play_animation(&mut self, name: impl Into<String>) -> bool {
         let name = name.into();
-        if (name == "Sit" && !self.config.allow_sit)
-            || (name == "Sleep" && !self.config.allow_sleep)
-            || (name == "Move" && !self.config.allow_walk)
-            || (name == "Special" && !self.config.allow_special)
-        {
+        if !crate::animation::animation_allowed(&name, &self.config) {
             return false;
         }
         self.animation.play(name)
@@ -164,7 +198,7 @@ impl CharacterState {
         }
         self.physics.start_drag(cursor);
         if self.config.allow_interact {
-            let _ = self.animation.play("Relax");
+            let _ = self.play_idle();
         }
     }
 
@@ -327,6 +361,70 @@ mod tests {
         assert_eq!(character.animation().direction, crate::Direction::Left);
         character.tick(1.0 / 60.0, bounds);
         assert!(character.position().x < 150.0);
+    }
+
+    #[test]
+    fn control_cannot_slide_a_battle_pose_without_a_move_animation() {
+        use crate::interaction::WalkControl;
+        let mut model = model();
+        model.animations = ["Idle", "Attack", "Skill_2_Loop"]
+            .map(str::to_owned)
+            .to_vec();
+        let mut character =
+            CharacterState::new(model, PetConfig::default(), Vec2::new(100.0, 100.0), 1);
+        let bounds = Bounds::new(1000.0, 500.0);
+        character.set_position(Vec2::new(300.0, 400.0), bounds);
+        character.play_animation("Skill_2_Loop");
+        character.tick_controlled(
+            0.1,
+            bounds,
+            Some(WalkControl {
+                direction: crate::Direction::Right,
+                fast: false,
+            }),
+        );
+        assert_eq!(character.position().x, 300.0);
+        assert_eq!(character.animation().animation, "Skill_2_Loop");
+    }
+
+    #[test]
+    fn controlled_walk_accelerates_without_saving_speed_or_turning_at_the_edge() {
+        use crate::interaction::WalkControl;
+        let mut character =
+            CharacterState::new(model(), PetConfig::default(), Vec2::new(100.0, 100.0), 1);
+        let bounds = Bounds::new(1000.0, 500.0);
+        character.set_position(Vec2::new(300.0, 400.0), bounds);
+        character.play_animation("Move");
+        for fast in [false, true] {
+            let before = character.position().x;
+            character.tick_controlled(
+                0.1,
+                bounds,
+                Some(WalkControl {
+                    direction: crate::Direction::Right,
+                    fast,
+                }),
+            );
+            assert!((character.position().x - before - if fast { 6.0 } else { 3.0 }).abs() < 0.001);
+            assert_eq!(character.config().walk_speed, 30.0);
+        }
+        character.set_position(Vec2::new(0.0, 400.0), bounds);
+        character.tick_controlled(
+            0.1,
+            bounds,
+            Some(WalkControl {
+                direction: crate::Direction::Left,
+                fast: false,
+            }),
+        );
+        assert_eq!(character.position().x, 0.0);
+        assert_eq!(character.animation().direction, crate::Direction::Left);
+        assert!(WalkControl {
+            direction: crate::Direction::Right,
+            fast: true
+        }
+        .speed(f32::MAX)
+        .is_finite());
     }
 
     #[test]

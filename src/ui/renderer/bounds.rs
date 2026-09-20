@@ -14,10 +14,13 @@ use eframe::egui::{ColorImage, Pos2, Rect};
 const ANALYSIS_SIZE: usize = 256;
 const MAX_SAMPLES: usize = 4096;
 const MIN_ALPHA: f32 = 1.0 / 255.0;
+const COMBAT_SAMPLE_RATE: f64 = 240.0;
+const MAX_COMBAT_SAMPLES: usize = 16384;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Calculation {
     pub rect: Rect,
+    pub canvas_rect: Rect,
     /// Coverage after fallback, before the usual 8-bit threshold rounding.
     pub effective_coverage: f32,
     pub samples: usize,
@@ -30,12 +33,22 @@ struct AnimationSamples {
     step: f64,
 }
 
+fn is_combat_animation(name: &str) -> bool {
+    // Conservative canvas padding only; this never selects or routes playback.
+    name.split('_').any(|part| {
+        let base = part.trim_end_matches(|c: char| c.is_ascii_digit());
+        ["attack", "combat", "skill"]
+            .iter()
+            .any(|kind| base.eq_ignore_ascii_case(kind))
+    })
+}
+
 impl AnimationSamples {
     fn time(&self, index: usize) -> f32 {
         if self.count == 1 {
             self.duration / 2.0
         } else {
-            (index as f64 * self.step) as f32
+            ((index as f64 * self.step) as f32).min(self.duration)
         }
     }
 }
@@ -82,6 +95,33 @@ fn sampling_plan(
     Ok(plan)
 }
 
+fn combat_sampling_plan(plan: &[AnimationSamples]) -> Result<Vec<AnimationSamples>, String> {
+    let mut total = 0;
+    let mut combat = Vec::new();
+    for animation in plan
+        .iter()
+        .filter(|animation| is_combat_animation(&animation.name))
+    {
+        // Sample short-lived weapon extremes independently of Alpha coverage,
+        // including both endpoints, without rasterizing every extra pose.
+        let count = (f64::from(animation.duration) * COMBAT_SAMPLE_RATE).ceil() + 1.0;
+        if count > (MAX_COMBAT_SAMPLES - total) as f64 {
+            return Err(format!(
+                "战斗动作范围分析超过 {MAX_COMBAT_SAMPLES} 个姿态，请减少模型动作或缩短动画"
+            ));
+        }
+        let count = count as usize;
+        total += count;
+        combat.push(AnimationSamples {
+            name: animation.name.clone(),
+            duration: animation.duration,
+            count,
+            step: 1.0 / COMBAT_SAMPLE_RATE,
+        });
+    }
+    Ok(combat)
+}
+
 /// Samples all animations and returns the unpadded crop in skeleton coordinates.
 ///
 /// Sampling changes the skeleton pose. Call this on a newly loaded analysis
@@ -93,6 +133,7 @@ pub(super) fn calculate(
     settings: &CanvasSettings,
 ) -> Result<Calculation, String> {
     let plan = sampling_plan(spine, settings)?;
+    let combat_plan = combat_sampling_plan(&plan)?;
     for image in images {
         if image.size.contains(&0)
             || image.size[0].checked_mul(image.size[1]) != Some(image.pixels.len())
@@ -102,6 +143,7 @@ pub(super) fn calculate(
     }
     let mut meshes = Vec::new();
     let mut geometry = Rect::NOTHING;
+    let mut combat_geometry = Rect::NOTHING;
     for animation in &plan {
         for index in 0..animation.count {
             sample(spine, animation, index, &mut meshes)?;
@@ -109,6 +151,20 @@ pub(super) fn calculate(
                 validate_mesh(mesh, images)?;
                 for &[x, y] in &mesh.positions {
                     geometry.extend_with(Pos2::new(x, y));
+                }
+            }
+        }
+    }
+    for animation in &combat_plan {
+        for index in 0..animation.count {
+            sample(spine, animation, index, &mut meshes)?;
+            for mesh in &meshes {
+                validate_mesh(mesh, images)?;
+                if mesh.color[3] > 0.0 {
+                    for &index in &mesh.indices {
+                        let [x, y] = mesh.positions[usize::from(index)];
+                        combat_geometry.extend_with(Pos2::new(x, y));
+                    }
                 }
             }
         }
@@ -139,10 +195,34 @@ pub(super) fn calculate(
         }
     }
     let (rect, effective_coverage) = mask.crop(settings.coverage)?;
+    let mut canvas_rect = rect;
+    if combat_geometry.is_finite() && combat_geometry.is_positive() {
+        // Coverage measures how often a pixel is occupied, not whether it can
+        // ever be visible. Reserve combat geometry before the native window
+        // clips it, with one analysis pixel for sampling/rounding differences.
+        let margin = geometry.width().max(geometry.height()) / ANALYSIS_SIZE as f32;
+        canvas_rect = rect.union(combat_geometry.expand(margin));
+        // Keep the original body's flip pivot fixed for both directions.
+        let center = rect.center().x;
+        let half_width = (center - canvas_rect.min.x).max(canvas_rect.max.x - center);
+        canvas_rect.min.x = center - half_width;
+        canvas_rect.max.x = center + half_width;
+        if !canvas_rect.is_finite()
+            || !canvas_rect.width().is_finite()
+            || !canvas_rect.height().is_finite()
+        {
+            return Err("战斗动作范围超出有效坐标范围".into());
+        }
+    }
     Ok(Calculation {
         rect,
+        canvas_rect,
         effective_coverage,
-        samples: total,
+        samples: total
+            + combat_plan
+                .iter()
+                .map(|animation| animation.count)
+                .sum::<usize>(),
     })
 }
 
@@ -181,6 +261,27 @@ fn validate_mesh(mesh: &MeshPart, images: &[ColorImage]) -> Result<(), String> {
         return Err("该模型使用尚未支持的 Multiply / Screen 混合模式".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn standing_ground(meshes: &[MeshPart], images: &[ColorImage]) -> Result<f32, String> {
+    let mut geometry = Rect::NOTHING;
+    for mesh in meshes {
+        validate_mesh(mesh, images)?;
+        for &[x, y] in &mesh.positions {
+            geometry.extend_with(Pos2::new(x, y));
+        }
+    }
+    if !geometry.is_finite() || !geometry.is_positive() || !geometry.size().is_finite() {
+        return Err("初始站立姿态没有有效范围，无法确定落地基准".into());
+    }
+    let mut mask = AlphaMask::new(geometry, 0.5);
+    for mesh in meshes {
+        if mesh.blend == 0 && mesh.color[3] > 0.0 {
+            mask.draw(mesh, &images[mesh.page], 1.0);
+        }
+    }
+    Ok(mask.crop(0.5)?.0.min.y)
 }
 
 struct AlphaMask {
@@ -551,5 +652,24 @@ mod tests {
         assert!(error.contains("4096"));
         spine.animations.clear();
         assert!(sampling_plan(&spine, &settings).is_err());
+    }
+
+    #[test]
+    fn combat_sampling_has_an_independent_bounded_budget() {
+        let plan = [AnimationSamples {
+            name: "Attack".into(),
+            duration: f32::MAX,
+            count: 1,
+            step: 1.0,
+        }];
+        let error = combat_sampling_plan(&plan).err().unwrap();
+        assert!(error.contains("16384"));
+        let zero_duration = [AnimationSamples {
+            duration: 0.0,
+            ..plan.into_iter().next().unwrap()
+        }];
+        let combat = combat_sampling_plan(&zero_duration).unwrap();
+        assert_eq!(combat[0].count, 1);
+        assert_eq!(combat[0].time(0), 0.0);
     }
 }

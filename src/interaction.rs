@@ -1,5 +1,18 @@
 use crate::{Direction, DirectionSwitching, PetConfig};
 
+/// Temporary input from a controller; never saved into the pet's configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkControl {
+    pub direction: Direction,
+    pub fast: bool,
+}
+
+impl WalkControl {
+    pub fn speed(self, base: f32) -> f32 {
+        (f64::from(base) * if self.fast { 2.0 } else { 1.0 }).min(f64::from(f32::MAX)) as f32
+    }
+}
+
 /// Tracks actual pointer motion, independently of a moving pet/window.
 #[derive(Default)]
 pub struct DirectionGesture {

@@ -1,0 +1,2 @@
+# Keep the upstream atlas bytes stable for SOURCE.md checksums on every platform.
+*.atlas -text

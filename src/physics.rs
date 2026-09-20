@@ -141,6 +141,15 @@ impl Default for PhysicsState {
 }
 
 impl PhysicsState {
+    pub fn translate(&mut self, delta: Vec2) {
+        self.position.x += delta.x;
+        self.position.y += delta.y;
+        if self.dragging {
+            self.drag_anchor.x -= delta.x;
+            self.drag_anchor.y -= delta.y;
+        }
+    }
+
     pub fn start_drag(&mut self, cursor: Vec2) {
         self.dragging = true;
         self.velocity = Vec2::ZERO;

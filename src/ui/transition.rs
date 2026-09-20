@@ -42,6 +42,15 @@ impl Presentation {
         }
     }
 
+    pub fn translate_position(&mut self, delta: eframe::egui::Vec2) {
+        if let Some(position) = &mut self.position {
+            for (index, offset) in [delta.x, delta.y].into_iter().enumerate() {
+                position.from[index] += offset;
+                position.target[index] += offset;
+            }
+        }
+    }
+
     pub fn facing(
         &mut self,
         direction: arkpets::Direction,

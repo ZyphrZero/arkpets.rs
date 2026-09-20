@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Serialize)]
 pub struct Settings {
     pub model: String,
+    pub form_mode: super::forms::Mode,
     pub page: String,
     pub fps: u32,
     pub warmup_seconds: u64,
@@ -25,6 +26,8 @@ pub struct Profile {
 #[derive(Default)]
 struct State {
     device: Option<eframe::wgpu::Device>,
+    desktop_geometry: Option<[f32; 5]>,
+    controls: Option<serde_json::Value>,
     started: Option<Instant>,
     started_unix_ms: u128,
     root: Frames,
@@ -90,6 +93,12 @@ impl Profile {
         })?;
         let settings = Settings {
             model: env::var("ARKPETS_PROFILE_MODEL").unwrap_or_else(|_| "pepe".into()),
+            form_mode: match env::var("ARKPETS_PROFILE_FORM").as_deref() {
+                Err(env::VarError::NotPresent) | Ok("auto") => super::forms::Mode::Auto,
+                Ok("base") => super::forms::Mode::Base,
+                Ok("battle") => super::forms::Mode::Battle,
+                _ => return Err("ARKPETS_PROFILE_FORM must be auto, base or battle".into()),
+            },
             page: match env::var("ARKPETS_PROFILE_PAGE") {
                 Err(env::VarError::NotPresent) => "settings".into(),
                 Ok(page) if matches!(page.as_str(), "library" | "settings") => page,
@@ -115,6 +124,72 @@ impl Profile {
             .lock()
             .expect("performance recorder lock poisoned")
             .device = Some(device);
+    }
+
+    /// Expose the collision area for native interaction checks. Canvas padding
+    /// can extend past the floor, so HWND bounds alone cannot verify landing.
+    pub fn record_desktop_geometry(
+        &self,
+        body: eframe::egui::Rect,
+        pixels_per_point: f32,
+    ) -> Result<(), String> {
+        let geometry = [
+            body.min.x,
+            body.min.y,
+            body.width(),
+            body.height(),
+            pixels_per_point,
+        ];
+        let mut state = self
+            .state
+            .lock()
+            .expect("performance recorder lock poisoned");
+        if state.desktop_geometry == Some(geometry) {
+            return Ok(());
+        }
+        let json = serde_json::json!({
+            "body": {"x": body.min.x, "y": body.min.y, "width": body.width(), "height": body.height()},
+            "pixels_per_point": pixels_per_point,
+        });
+        let temporary = self.directory.join("desktop-geometry.tmp");
+        fs::write(&temporary, json.to_string())
+            .and_then(|()| fs::rename(&temporary, self.directory.join("desktop-geometry.json")))
+            .map_err(|error| format!("Cannot write desktop geometry: {error}"))?;
+        state.desktop_geometry = Some(geometry);
+        Ok(())
+    }
+
+    pub fn record_controls(
+        &self,
+        runtime: &arkpets::PetRuntime,
+        walking: Option<arkpets::interaction::WalkControl>,
+        active_model: &str,
+        form: Option<arkpets::model::ModelForm>,
+    ) -> Result<(), String> {
+        let value = serde_json::json!({
+            "animation": runtime.character().animation().animation,
+            "direction": runtime.character().animation().direction,
+            "automatic": runtime.automatic(),
+            "paused": runtime.paused(),
+            "walking": walking.is_some(),
+            "fast": walking.is_some_and(|control| control.fast),
+            "walk_speed": runtime.character().config().walk_speed,
+            "active_model": active_model,
+            "form": form,
+        });
+        let mut state = self
+            .state
+            .lock()
+            .expect("performance recorder lock poisoned");
+        if state.controls.as_ref() == Some(&value) {
+            return Ok(());
+        }
+        let temporary = self.directory.join("controls.tmp");
+        fs::write(&temporary, value.to_string())
+            .and_then(|()| fs::rename(&temporary, self.directory.join("controls.json")))
+            .map_err(|error| format!("Cannot write control diagnostic: {error}"))?;
+        state.controls = Some(value);
+        Ok(())
     }
 
     pub fn root_update_finished(&self, started: Instant) {

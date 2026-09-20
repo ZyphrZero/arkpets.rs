@@ -6,6 +6,13 @@ use std::{
 };
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelForm {
+    Base,
+    Battle,
+}
+
 /// A Spine character and the files required by a renderer to load it.
 ///
 /// The first six fields mirror ArkPets-Web's `CharacterModel`. The remaining
@@ -16,6 +23,9 @@ use thiserror::Error;
 pub struct CharacterModel {
     pub id: String,
     pub name: String,
+    pub character_id: Option<String>,
+    pub skin_id: Option<String>,
+    pub form: Option<ModelForm>,
     pub skeleton: String,
     pub atlas: String,
     pub texture: String,
@@ -36,6 +46,19 @@ pub struct CharacterModel {
 }
 
 impl CharacterModel {
+    pub fn same_character(&self, other: &Self) -> bool {
+        match (
+            &self.character_id,
+            &self.skin_id,
+            &other.character_id,
+            &other.skin_id,
+        ) {
+            (Some(a), Some(skin_a), Some(b), Some(skin_b)) => a == b && skin_a == skin_b,
+            (None, None, None, None) => self.id == other.id,
+            _ => false,
+        }
+    }
+
     pub fn resource_names(&self) -> Vec<&str> {
         [&self.skeleton, &self.atlas, &self.texture]
             .into_iter()
@@ -148,6 +171,80 @@ pub struct ModelCatalog {
 }
 
 impl ModelCatalog {
+    pub fn form_indices(&self, index: usize) -> Result<Vec<usize>, ModelError> {
+        let selected = &self.models[index];
+        if selected.character_id.is_none() && selected.skin_id.is_none() && selected.form.is_none()
+        {
+            return Ok(vec![index]);
+        }
+        if selected
+            .character_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+            || selected
+                .skin_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            || selected.form.is_none()
+        {
+            return Err(ModelError::Invalid(
+                selected.id.clone(),
+                "characterId, skinId and form must be provided together and nonempty",
+            ));
+        }
+        let mut indices = Vec::new();
+        for (index, model) in self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| selected.same_character(model))
+        {
+            if model.form.is_some()
+                && indices
+                    .iter()
+                    .any(|&i: &usize| self.models[i].form == model.form)
+            {
+                return Err(ModelError::Invalid(
+                    selected.id.clone(),
+                    "duplicate form for the same character and skin",
+                ));
+            }
+            indices.push(index);
+        }
+        Ok(indices)
+    }
+
+    pub fn representative(&self, index: usize) -> usize {
+        if self.models[index].character_id.is_none() {
+            return index;
+        }
+        self.models
+            .iter()
+            .position(|model| {
+                self.models[index].same_character(model) && model.form == Some(ModelForm::Base)
+            })
+            .unwrap_or(index)
+    }
+
+    pub fn character_indices(&self) -> Vec<usize> {
+        let mut result = Vec::new();
+        for index in 0..self.models.len() {
+            let representative = self.representative(index);
+            if !result.contains(&representative) {
+                result.push(representative);
+            }
+        }
+        result
+    }
+
+    fn checked(models: Vec<CharacterModel>) -> Result<Self, ModelError> {
+        let catalog = Self::new(models);
+        for index in 0..catalog.models.len() {
+            catalog.form_indices(index)?;
+        }
+        Ok(catalog)
+    }
+
     pub fn new(models: Vec<CharacterModel>) -> Self {
         Self { models }
     }
@@ -162,10 +259,10 @@ impl ModelCatalog {
                 .collect::<Result<Vec<_>, _>>()?,
             Value::Object(mut object) => {
                 if object.contains_key("skeleton") {
-                    return Ok(Self::new(vec![CharacterModel::from_dataset_item(
+                    return Self::checked(vec![CharacterModel::from_dataset_item(
                         "",
                         Value::Object(object),
-                    )?]));
+                    )?]);
                 }
                 if let Some(models) = object.remove("models") {
                     return Self::from_json(&serde_json::to_string(&models)?);
@@ -207,7 +304,7 @@ impl ModelCatalog {
                 ))
             }
         };
-        Ok(Self::new(models))
+        Self::checked(models)
     }
 
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, ModelError> {
@@ -253,6 +350,26 @@ impl ModelCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forms_are_paired_only_by_explicit_character_and_skin_metadata() {
+        let json = r#"[
+            {"id":"a","name":"A","characterId":"texas","skinId":"default","form":"base"},
+            {"id":"b","name":"B","characterId":"texas","skinId":"default","form":"battle"},
+            {"id":"c","name":"A（战斗）","characterId":"texas","skinId":"skin2","form":"battle"},
+            {"id":"d","name":"A（战斗）"}
+        ]"#;
+        let catalog = ModelCatalog::from_json(json).unwrap();
+        assert_eq!(catalog.form_indices(0).unwrap(), [0, 1]);
+        assert_eq!(catalog.form_indices(2).unwrap(), [2]);
+        assert_eq!(catalog.form_indices(3).unwrap(), [3]);
+        assert_eq!(catalog.character_indices(), [0, 2, 3]);
+        assert!(ModelCatalog::from_json(r#"[{"id":"x","characterId":"x"}]"#).is_err());
+        assert!(
+            ModelCatalog::from_json(&json.replace("\"form\":\"base\"", "\"form\":\"battle\""))
+                .is_err()
+        );
+    }
 
     #[test]
     fn parses_web_manifest_and_searches_metadata() {

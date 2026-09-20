@@ -12,6 +12,8 @@ pub struct DesktopMotion {
     pub body: PhysicsState,
     pub work_area: Rect,
     pub last_tick: Instant,
+    /// Displayed physics-body origin; UI subtracts the canvas overhang when
+    /// positioning the native window.
     pub last_window_position: Option<Pos2>,
     pub next_work_area_update: Instant,
     #[cfg(windows)]
@@ -246,6 +248,46 @@ impl DesktopMotion {
         }
     }
 
+    pub fn step_controlled(
+        &mut self,
+        dt: f32,
+        size: Vec2,
+        config: &PetConfig,
+        control: arkpets::interaction::WalkControl,
+    ) {
+        let mut movement_config = config.clone();
+        movement_config.walk_speed = control.speed(config.walk_speed);
+        // Reuse region collision and DPI handling. Edge turning must not change
+        // the user's held direction; the caller keeps the controller's facing.
+        let mut direction = control.direction;
+        self.step(dt, size, &movement_config, true, &mut direction);
+    }
+
+    pub fn reframe(&mut self, size: Vec2) -> io::Result<Vec2> {
+        let delta = Vec2::new((self.size.x - size.x) * 0.5, self.size.y - size.y);
+        let target = self.screen_position() + delta;
+        let projected = regions::project(target, size, &self.areas)
+            .ok_or_else(|| io::Error::other("新形态超出可用屏幕区域，请减小显示比例"))?;
+        let shown = self.last_window_position.map(|position| {
+            regions::project(position + delta, size, &self.areas).expect("validated form size")
+        });
+        if self.body.dragging {
+            self.drag_offset = (self.drag_offset * self.size - delta) / size;
+        }
+        self.body.position = self.local_cursor(projected);
+        self.last_window_position = shown;
+        self.size = size;
+        self.display_waypoints.clear();
+        if (target.x - projected.x).abs() > 0.01 {
+            self.body.velocity.x = 0.0;
+        }
+        if (target.y - projected.y).abs() > 0.01 {
+            self.body.velocity.y = 0.0;
+        }
+        self.next_work_area_update = Instant::now();
+        Ok(delta)
+    }
+
     pub fn step(
         &mut self,
         dt: f32,
@@ -446,6 +488,33 @@ mod tests {
             movement_area(monitor, work, Some(u32::MAX), 1.5).height(),
             1.0
         );
+    }
+
+    #[test]
+    fn form_reframing_preserves_displayed_feet_and_velocity_across_dpi() {
+        for scale in [1.0, 1.5, 2.0] {
+            let area = Rect::from_min_size(
+                Pos2::new(-2560.0 / scale, 0.0),
+                Vec2::new(2560.0 / scale, 1440.0 / scale),
+            );
+            let old = Vec2::new(220.0, 240.0);
+            let mut motion =
+                DesktopMotion::deploy(vec![area], area, old, [0.5, 1.0], scale).unwrap();
+            motion.finish_deployment(area, old);
+            motion.last_window_position = Some(motion.screen_position());
+            motion.body.velocity = PetVec2::new(17.0, -12.0);
+            let original = (motion.screen_position() + Vec2::new(old.x * 0.5, old.y)) * scale;
+            for size in [Vec2::new(310.0, 190.0), Vec2::new(150.0, 330.0), old] {
+                motion.reframe(size).unwrap();
+                let foot = Vec2::new(size.x * 0.5, size.y);
+                assert!(((motion.screen_position() + foot) * scale).distance(original) < 0.001);
+                assert!(
+                    ((motion.last_window_position.unwrap() + foot) * scale).distance(original)
+                        < 0.001
+                );
+                assert_eq!(motion.body.velocity, PetVec2::new(17.0, -12.0));
+            }
+        }
     }
 
     #[test]

@@ -602,6 +602,56 @@ mod tests {
     }
 
     #[test]
+    fn bundled_catalog_plays_raw_clips_without_name_classification() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let catalog = crate::ModelCatalog::from_json_file(root.join("models.json")).unwrap();
+        for model in &catalog.models {
+            let paths = model.resource_paths(&root);
+            let mut spine = Spine::load(&paths[0], &paths[1]).unwrap();
+            let mut animated = false;
+            for name in spine.animations.clone() {
+                let duration = spine.animation_duration(&name).unwrap();
+                assert!(
+                    duration.is_finite() && duration >= 0.0,
+                    "{}: {name}",
+                    model.id
+                );
+                if duration == 0.0 {
+                    spine.sample_animation(&name, 0.0).unwrap();
+                    continue;
+                }
+                spine.play_with_mix(&name, true, 0.0).unwrap();
+                spine.update(0.0, 0.0);
+                let before = positions(&mut spine);
+                let mut changed = false;
+                let mut completed = 0;
+                for _ in 0..(duration * 60.0 * 2.5).ceil() as usize {
+                    completed += usize::from(spine.update(1.0 / 60.0, 0.0));
+                    let after = positions(&mut spine);
+                    assert!(after.iter().flatten().all(|value| value.is_finite()));
+                    changed |= before != after;
+                }
+                assert!(
+                    completed >= 2,
+                    "{}: {name} did not animate through multiple loops",
+                    model.id
+                );
+                animated |= changed;
+            }
+            assert!(animated, "{}: no animated geometry", model.id);
+            if spine.animations.iter().any(|name| name == "Start") {
+                let duration = spine.animation_duration("Start").unwrap();
+                spine.play_with_mix("Start", false, 0.0).unwrap();
+                let mut completed = 0;
+                for _ in 0..(duration * 60.0 * 2.5 + 2.0).ceil() as usize {
+                    completed += usize::from(spine.update(1.0 / 60.0, 0.0));
+                }
+                assert_eq!(completed, 1, "{}: entrance must play once", model.id);
+            }
+        }
+    }
+
+    #[test]
     fn real_models_load_and_produce_animated_meshes() {
         for id in ["4058_pepe", "1038_whitw2", "4093_frston"] {
             let mut spine = load_model(id);
@@ -630,6 +680,41 @@ mod tests {
                 .iter()
                 .all(|i| usize::from(*i) < mesh.positions.len())));
         }
+    }
+
+    #[test]
+    fn lappland_battle_attacks_use_real_animated_geometry() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let catalog = crate::ModelCatalog::from_json_file(root.join("models.json")).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.id == "whitw2-battle")
+            .unwrap();
+        model.validate(Some(&root)).unwrap();
+        let paths = model.resource_paths(&root);
+        let mut spine = Spine::load(&paths[0], &paths[1]).unwrap();
+        assert!(spine.pages.iter().all(|path| path.is_file()));
+        assert!(spine.animations.iter().any(|name| name == "Idle"));
+        let duration = spine.animation_duration("Attack").unwrap();
+        assert!(duration > 0.0);
+        spine.play_with_mix("Attack", true, 0.0).unwrap();
+        spine.update(0.0, 0.0);
+        let before = positions(&mut spine);
+        assert!(before.len() > 20);
+        let mut completed = 0;
+        let mut changed = false;
+        for _ in 0..(duration * 60.0 * 2.5).ceil() as usize {
+            completed += usize::from(spine.update(1.0 / 60.0, 0.0));
+            let after = positions(&mut spine);
+            assert!(after.iter().flatten().all(|value| value.is_finite()));
+            changed |= before != after;
+        }
+        assert!(changed, "Attack must advance the real skeleton");
+        assert!(
+            completed >= 2,
+            "manual Attack must support repeated playback"
+        );
     }
 
     #[test]

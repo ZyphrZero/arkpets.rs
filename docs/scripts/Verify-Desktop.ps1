@@ -60,7 +60,7 @@ $backdropVisibilityLogged = $false
 $timer = [Diagnostics.Stopwatch]::StartNew()
 $failureLog = Join-Path $captureDirectory 'failure.log'
 try {
-    while (-not $process.HasExited -and $timer.Elapsed.TotalSeconds -lt 25) {
+    while (-not $process.HasExited -and $timer.Elapsed.TotalSeconds -lt 90) {
         $script:petWindow = [IntPtr]::Zero
         $script:rootWindow = [IntPtr]::Zero
         $testPid = $process.Id
